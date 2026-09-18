@@ -66,6 +66,58 @@ from .store import NO_CHECKPOINT, PositionStore, WriteBatch
 ChangeListener = Callable[[tuple[Position, ...]], Awaitable[None]]
 
 
+def combine_listeners(*listeners: ChangeListener) -> ChangeListener:
+    """Fan one change notification out to several listeners, in the order given.
+
+    Slice 4 is the first point at which two things want the same notification: the cache wants to
+    refresh its entries and the hub wants to wake its subscribers. `Projector` still takes exactly
+    one listener, and that is deliberate — a `list[ChangeListener]` parameter would put two policy
+    decisions inside the projector (what order, and what to do when one of them raises) that the
+    projector has no information to make. Composed here, both are the caller's choice and visible at
+    the call site:
+
+        Projector(store, on_change=combine_listeners(cache.on_change, hub.publish))
+
+    ⚠️ EVERY LISTENER RUNS EVEN IF AN EARLIER ONE RAISES, AND THAT IS NOT DEFENSIVE PADDING.
+       The obvious implementation is a bare loop, which stops at the first failure. Consider what
+       that costs with the wiring above: the cache refresh raises, so `hub.publish` never runs, so
+       no subscriber is told about the change. The projector propagates, the consumer retries the
+       event, and `project` returns `DUPLICATE` — correctly, because the commit already happened —
+       which means the notification is never regenerated. One transient failure in the cache
+       silently costs every live subscriber that update, permanently. Running all of them and
+       raising afterwards keeps a failure in one consumer from being a data loss in another.
+
+    `Exception` and not `BaseException`, so a `CancelledError` propagates immediately rather than
+    being deferred until after the remaining listeners have run: a cancelled task should stop, and
+    "finish the fan-out first" is exactly what cancellation is asking it not to do.
+
+    On the ordering: the cache is listed first by convention, so that a cached read taken after a
+    notification cannot return an older version than the notification carried. Today that ordering
+    is not load-bearing, and it is worth being precise about why rather than claiming a hazard that
+    does not exist — neither listener suspends (ADR-030), so nothing can interleave between them and
+    no caller can observe the intermediate state. The convention costs nothing and is the order that
+    stays correct on the day one of them grows an `await`.
+    """
+
+    async def notify(positions: tuple[Position, ...]) -> None:
+        errors: list[Exception] = []
+        for listener in listeners:
+            try:
+                await listener(positions)
+            except Exception as error:
+                errors.append(error)
+
+        if len(errors) == 1:
+            # Re-raising the object rather than wrapping it keeps the original traceback and lets a
+            # caller catch the specific type it expected. A single failure is the common case and
+            # should not become harder to handle because a fan-out was involved.
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("change listeners failed", errors)
+
+    return notify
+
+
 @dataclass(frozen=True)
 class Refused:
     """The message could not be decoded, so nothing about it is known — not even its `event_id`.

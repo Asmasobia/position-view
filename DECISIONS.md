@@ -1279,3 +1279,401 @@ list.
 **Cost accepted.** The prune scans the subscriber list on every publish. It is O(subscribers) against a
 fan-out that is already O(subscribers × positions), so it changes nothing asymptotically, and it is the
 same list the loop below it walks anyway.
+
+---
+
+## ADR-038 — The cache is deliberately not a `PositionStore`, and a test pins its public surface
+
+**Status:** accepted (slice 4)
+
+**Context.** `CachedPositions` wraps a `PositionStore` and serves reads from memory. It would take five
+passthrough methods — `commit`, `all_positions`, `snapshot_for`, `checkpoint`, `snapshot_count` — to
+make it satisfy the `PositionStore` protocol, and doing so reads like an improvement: the api layer
+could then accept a single type and be handed either the store or the cached store, and the wiring
+would get shorter.
+
+**Decision.** The cache exposes `position_for`, `refresh`, `on_change`, `invalidate`, `clear` and its
+report, and nothing else. It cannot be substituted for a store. `tests/test_cache.py` asserts the exact
+set of public attribute names, so adding one means arguing with a failing test rather than getting a
+green build.
+
+**Why.** The moment the cache is substitutable, this line compiles:
+
+```python
+projector = Projector(CachedPositions(store))
+```
+
+and the projection's read-modify-write cycle starts reading cached positions.
+`_build_changed_positions` reads a position, applies the event's deltas to it, and commits the result.
+Read a version that is one change out of date and the committed position is short by exactly that
+change — and then that wrong value is the store's truth, is served to every reader, and is reproduced
+identically on every replay. Nothing detects it: no counter moves, no exception is raised, the event is
+`APPLIED`, and the projector's `asyncio.Lock` cannot help because the lock serialises access to the
+*store* and the stale value did not come from there.
+
+That is a silent money bug arriving via a refactor that looks like tidying up, which is the worst
+combination available: the change is small, the diff is pleasant to review, and the symptom appears
+days later as a reconciliation break with no obvious cause.
+
+**Cost accepted.** The api layer takes two collaborators where it could have taken one, and a
+`PositionStore` and a `CachedPositions` cannot be swapped in a test. That is the point: they are not
+interchangeable, and a type system that said they were would be lying.
+
+**Rejected alternative.** Implement the protocol and document the danger in a comment. Comments do not
+fail builds, and the reader who would benefit most from this one is the reader who is deleting
+duplication and has not read it. A structural test is the only form of the warning that survives.
+
+---
+
+## ADR-039 — Exactly one store method is cached, and the other four are named as omissions
+
+**Status:** accepted (slice 4)
+
+**Context.** `PositionStore` has five read/write methods. A cache could plausibly front several of
+them.
+
+**Decision.** Only `position_for` is cached. The omissions are listed in the module docstring with the
+reason for each.
+
+**Why.**
+
+- `all_positions` is invalidated by any change to any position. On a live stream that is a cache with a
+  near-100% miss rate: memory cost, coherence risk, no benefit.
+- `snapshot_for` has exactly one caller, the projector, and per ADR-038 the projector must never read
+  through a cache.
+- `checkpoint` is the number that answers "have you caught up yet?" for slice 5's read-your-writes
+  parameter. Caching it is a contradiction in terms — a stale checkpoint makes the freshness check
+  itself unreliable, which is worse than not having one.
+- `commit` is a write, and a write-through cache would put the cache on the path that has to be atomic.
+
+**Cost accepted.** A future "list all positions" endpoint gets no help from this cache and will need its
+own answer (pagination, or a periodically rebuilt materialised list). Naming that now is cheaper than
+discovering it after a cache has been wired into the wrong place.
+
+---
+
+## ADR-040 — Single-flight is a task register plus `asyncio.shield`, not a bare `await`
+
+**Status:** accepted (slice 4)
+
+**Context.** A hot position is evicted or has never been read, fifty requests miss at the same moment,
+and fifty identical reads reach the store. The load the cache exists to prevent arrives all at once, at
+exactly the moment the position is most popular. The fix is single-flight: one load per key, every other
+caller waits on it.
+
+**Decision.** `_in_flight: dict[PositionKey, asyncio.Task]`. The first miss creates a task; every
+concurrent miss for the same key awaits `asyncio.shield(load)`; the task pops its own key in a
+`finally`.
+
+**Why `create_task` and not "the first caller does the work inline".** A leader-does-the-work design
+needs a `Future` per key, manual `set_result`/`set_exception` propagation to the waiters, and its own
+answer to "what happens when the leader is cancelled" — which is that the followers wait forever unless
+the leader has a `finally` that resolves the future with something. A task is the stdlib's own version
+of that machinery, already correct.
+
+**Why `shield` and not `await load`.** ⚠️ Cancelling a task cancels the future it is awaiting. With a
+bare `await load`, one HTTP client disconnecting — the single most common event in a web service —
+cancels the *shared* load, and every other waiter on that key receives a `CancelledError` for a request
+it had nothing to do with. The symptom is intermittent, load-dependent, concentrated on the most
+popular keys, and completely invisible to any sequential test: one impatient browser tab failing forty
+unrelated requests. `shield` gives each waiter a cancellable wrapper around an uncancellable load.
+
+A second consequence, and a good one: because the load is nobody's child, it finishes even if every
+caller has left, so the work the departed caller paid for still warms the cache.
+
+**Why the task is referenced from `_in_flight`.** An `asyncio.Task` with no strong reference can be
+garbage-collected mid-flight. The register is that reference; it is not only bookkeeping.
+
+**Cost accepted.** A task allocation per cache miss, and a done-callback per task (ADR-046). Both are
+cheap next to the store read they de-duplicate, and both cost nothing on a hit.
+
+---
+
+## ADR-041 — An absence is cached as a value, which makes `dict.get` unusable for miss detection
+
+**Status:** accepted (slice 4)
+
+**Context.** `position_for` returns `None` for a counterparty nothing has contributed to, and slice 5
+turns that into a 404. A cache that stores only hits therefore forwards every 404 to the store.
+
+**Decision.** `None` is cached as a value. Every miss check is an explicit membership test —
+`if key in self._entries` — never `self._entries.get(key)`. Hits and negative hits are counted
+separately.
+
+**Why.** Without negative caching, the cheapest way to put load on this service is to ask about
+counterparties that do not exist: no cache in the way, one store read per request, and nothing in the
+metrics that looks like an attack rather than traffic. Caching the absence makes the second such
+request as cheap as the second request for anything else.
+
+⚠️ **The consequence is a trap that reads as tidy code.** `self._entries.get(key)` returns `None` for
+"cached absence" and `None` for "not cached at all", so a `.get`-based miss check silently disables
+negative caching while the counters keep incrementing as though it worked. It is the kind of change a
+linter would suggest. Hence the explicit membership tests, a comment at each one, and a mutation in the
+matrix that swaps one in.
+
+Two counters rather than one because they describe different callers: a high `hits` is a cache doing its
+job, a high `negative_hits` is a client polling for something that has not happened or somebody
+enumerating names. Summed, neither is visible.
+
+**Cost accepted.** The key space becomes "strings a caller can send" rather than "positions that
+exist", which is what forces ADR-042's bound. An absence cached just before the first event for that
+counterparty is served until the change notification arrives — bounded by the notification, not by a
+timeout, and version 0 as the sentinel is what makes the upgrade automatic.
+
+---
+
+## ADR-042 — The cache is bounded and evicts least-recently-*requested*
+
+**Status:** accepted (slice 4)
+
+**Context.** With absences cached (ADR-041), an unbounded map is a memory leak with a remote trigger:
+any caller can add entries to it by asking about names nobody has ever used.
+
+**Decision.** `DEFAULT_MAX_ENTRIES = 4096`, LRU eviction on insert, `max_entries < 1` refused at
+construction. Absences count against the bound like anything else. A read promotes; a refresh
+(ADR-044) does not.
+
+**Why 4096, and why the test asserts a floor rather than the number.** It is a judgement, not a
+measurement: comfortably more than the working set of a dashboard or a handful of API consumers,
+comfortably less than a whole book, and any value that is not "unlimited" answers the security question.
+The test pins that the constructor default *is* the exported constant and that the constant is at least
+1024 — because an assertion of "the default is the constant" is satisfied by a constant of 8, and a
+cache that evicts an ordinary working set on every read looks like a cache that does not work rather
+than like a failure.
+
+**Why a zero bound is refused rather than accepted.** "Caching disabled" is expressed by not
+constructing a cache. A `max_entries=0` that silently missed on every read would be a configuration
+typo that manifests as a performance incident with no error anywhere.
+
+**Cost accepted.** `OrderedDict` bookkeeping on every hit, and a working set larger than the bound
+thrashes. Both are visible: `evictions` climbing alongside a falling `hit_rate` is the signal to raise
+the number.
+
+---
+
+## ADR-043 — Invalidation comes from the change stream by version; there is no clock and no TTL
+
+**Status:** accepted (slice 4)
+
+**Context.** The default answer for cache coherence is a TTL. This service has something better
+available: the projector already publishes every changed position to a `ChangeListener` (ADR-021), with
+the new value attached.
+
+**Decision.** No TTL, no clock, no `time` import in the package. `CachedPositions.on_change` is a
+`ChangeListener`; entries are updated when a change arrives, compared by `version`. A cached absence
+compares as `UNCACHED_VERSION = 0`.
+
+**Why.** A TTL is what you use when you cannot know when the underlying value changed. Given a precise
+signal, a TTL is a decision to serve a known-wrong answer for up to `ttl` seconds — strictly worse on
+both axes at once: staler than necessary *and* more store reads than necessary. It also introduces the
+only thing this repository has managed to avoid entirely so far, which is a test that depends on time
+passing.
+
+**Why version 0 is a safe sentinel.** `_empty_position` starts at version 0 and `with_deltas` bumps
+before anything is committed, so version 0 is never published. Every real change is therefore strictly
+newer than a cached absence, and "this counterparty does not exist" upgrades to "here it is" with no
+special case.
+
+**Why the comparison exists at all, given that publish order is version order.** Per-key ordering holds
+only because the projector notifies while holding its lock (ADR-022) — a fact the cache cannot verify
+from where it sits. A cache that trusts an invariant it cannot check is a cache that starts going
+backwards silently on the day the invariant moves; `refreshes_dropped_stale` is the alarm for that day,
+and it should read zero forever.
+
+**Cost accepted.** The cache is only as correct as the notification path. If a change is committed
+without notifying — an offline rebuild, a manual repair, a direct write to the store — the cache does
+not find out, because there is no timeout to save it. That is a real operational hazard, and it is why
+`invalidate` and `clear` exist as an explicit rescue path (ADR-045).
+
+---
+
+## ADR-044 — A refresh updates in place, never inserts, and never promotes
+
+**Status:** accepted (slice 4)
+
+**Context.** A change notification arrives for a position. Three plausible behaviours: drop the entry,
+update it, or insert it if absent.
+
+**Decision.** If the key is cached and the incoming version is strictly newer, the entry is overwritten
+in place. If the key is not cached, the notification is dropped and counted
+(`refreshes_dropped_cold`). Either way the entry's position in the LRU order is unchanged.
+
+**Why update rather than drop.** Dropping creates a miss at the exact moment the position is being
+written to, which is when it is hottest. A busy position would stampede on every change, and
+single-flight would spend its life absorbing traffic the cache created for itself. The notification
+already carries the new value, so there is nothing to reload.
+
+**Why never insert.** ⚠️ *A cache is populated by reads and updated by writes; it is never populated by
+writes.* Inserting looks like free warming — the value is right there — and it hands the event stream
+control of what the cache holds. An hour of activity on positions nobody queries would evict the working
+set the API is actually serving. Since a live stream touches every position while the cache holds only
+what was read, most notifications land in the cold-drop branch, and that is correct rather than
+wasteful.
+
+**Why never promote.** Recency has to mean "recently *requested*", not "recently changed". Promoting on
+refresh would keep a churning, unread position resident forever while evicting a position read every
+second for being calm — so the hit rate would degrade as the *stream* got busier rather than as the
+*traffic* changed, which inverts the signal an operator would use to size the cache.
+
+**Cost accepted.** A position that changes constantly and is read rarely is re-read on each of those
+rare reads. That is the intended trade: reads pay for reads.
+
+---
+
+## ADR-045 — The read-through/invalidate race is closed by a held-change map and a generation counter
+
+**Status:** accepted (slice 4)
+
+**Context.** Every read-through cache with an invalidation signal has the same race, and it is the
+classic bug in the pattern:
+
+1. a load reads version 6 from the store,
+2. a change to version 7 lands while the read is still in flight,
+3. the refresh finds nothing cached and correctly declines to insert (ADR-044),
+4. the load completes and stores version 6.
+
+The cache is now stale with no signal that it is, and stays stale until the next change to that
+position — for a quiet position, indefinitely.
+
+**Decision.** Two mechanisms, for two different failures.
+
+- `_changed_while_loading`: a refresh for a key with a load in flight is held rather than dropped, and
+  at the end of the load the newer of (held change, store result) wins. One slot per key, keeping the
+  newest, cleared in the load's `finally`.
+- `_generation`: an integer bumped by `clear` and by `invalidate`. `position_for` captures it when it
+  decides to load and passes it in; if it has changed by the time the load finishes, the value is
+  returned to the caller but not stored (`loads_discarded`).
+
+**Why the held change is compared and not preferred.** Both interleavings are legitimate: the commit may
+land before the store read or after it. If before, the read already returned version 7 and the
+notification is a duplicate — so "the held change wins" would push the cache *backwards* on an ordinary
+interleaving. Version comparison is right in both orders, which means the code does not depend on
+knowing which one happened.
+
+**Why the generation is captured in `position_for` and not on `_load`'s first line.** ⚠️
+`asyncio.create_task` *schedules* a coroutine; it does not start it. A generation read inside `_load`
+therefore happens some number of event-loop ticks after the decision to load, and a `clear()` landing in
+that window would be captured as the load's own starting generation — so the load would consider itself
+current and refill the cache it was supposed to be discarded by. This was found by a test that cleared
+the cache immediately after observing `in_flight == 1`, which is exactly the window; the matrix now
+carries a mutation that reopens it.
+
+**Why one global generation rather than one per key.** A single-key `invalidate` also discards other
+keys' loads in flight. That is wasteful — they are re-read on the next request — and never wrong, and
+invalidation is an operational rescue path rather than a hot one. A per-key counter would be more
+precise and would add a second unbounded-by-caller-input map to keep bounded, on a path that gets no
+traffic.
+
+**Cost accepted.** Two extra pieces of state whose whole purpose is the window around one `await`, and
+neither is observable except with a store double that can be held mid-read. That is what
+`ReadCountingStore`'s gate is for, and it is why ADR-023's "a double that never suspends measures
+nothing" is quoted at the top of `test_cache.py`.
+
+---
+
+## ADR-046 — A failed read is never cached, and the `except` clause is narrow on purpose
+
+**Status:** accepted (slice 4)
+
+**Context.** The store read inside `_load` can raise. The tempting shortcut is one line:
+`except Exception: return None`.
+
+**Decision.** A failure is counted (`load_failures`) and re-raised to every waiter. Nothing is cached,
+positively or negatively. `_in_flight` and `_changed_while_loading` are cleared in a `finally`. The
+clause catches `Exception`, not `BaseException`. Loads that fail with nobody left to hear about it have
+their exception retrieved by a done-callback.
+
+**Why nothing is cached.** ⚠️ `except: return None` converts a five-second database wobble into a 404
+that lasts as long as the entry. A client asking about a counterparty with real exposure is told, with
+a perfectly ordinary and unalarming status code, that it does not exist — and the error rate *drops*
+while the service is lying. Failing the request is worse for one caller and honest for all of them, and
+the retry lands on a cache that has learnt nothing false.
+
+**Why the `finally`.** Without it, the in-flight register keeps a finished, failed task, and every later
+request for that key awaits it and receives the same exception — forever, for that one key, with the
+store perfectly healthy. One transient error would permanently poison one counterparty.
+
+**Why `Exception` and not `BaseException`.** A `CancelledError` is this task being torn down, not the
+store being broken. Counting it as a store failure would make every orderly shutdown add to the failure
+count, so a routine deploy would look on the dashboard exactly like a database outage. The test raises a
+purpose-built `BaseException` subclass rather than a real `KeyboardInterrupt`, because pytest reads a
+`KeyboardInterrupt` as a request to abandon the session.
+
+**Why the done-callback.** When a load fails and every waiter has already gone away, nobody retrieves
+the exception, so asyncio logs "Task exception was never retrieved" when the task is collected. The
+failure is already counted and the caller that cared has already had it raised, so the line is noise —
+but it is *alarming* noise, arriving at collection time rather than failure time, with a traceback and
+no request context, and the cost of noise like that is paid on the day it hides something real. The
+callback is a module-level function rather than a closure so that it does not keep the cache alive, and
+it guards on `not task.cancelled()` because asking a cancelled task for its exception raises.
+
+**Cost accepted.** A store outage becomes a wave of 5xx rather than a wave of 404s, and the cache offers
+no protection during it. That is the correct failure mode for a service whose answers are money.
+
+---
+
+## ADR-047 — `combine_listeners` runs every listener, then raises
+
+**Status:** accepted (slice 4)
+
+**Context.** Slice 4 is the first point at which two things want the same change notification: the cache
+wants to refresh its entries, and the hub wants to wake its subscribers. `Projector` takes exactly one
+`ChangeListener`.
+
+**Decision.** A `combine_listeners(*listeners)` helper in `projection/`, beside the `ChangeListener`
+type. It awaits each listener in order, collects failures rather than stopping, and afterwards re-raises
+a single failure unwrapped or raises an `ExceptionGroup`. `Projector` still takes one listener.
+
+**Why not a `list[ChangeListener]` parameter on the projector.** That would move two policy decisions —
+what order, and what to do when one fails — into the projector, which has no information with which to
+make either. Composed at the call site, both are the caller's and both are visible in one line.
+
+**Why every listener runs.** ⚠️ The obvious implementation is a bare loop, which stops at the first
+failure. With the wiring above that means: the cache refresh raises, so `hub.publish` never runs, so no
+subscriber is told about the change. The projector propagates, the consumer retries the event, and
+`project` returns `DUPLICATE` — correctly, because the commit already happened — so the notification is
+never regenerated. One transient failure in the cache costs every live subscriber that update,
+permanently. Running all of them keeps a failure in one consumer from being data loss in another.
+
+**Why a single failure is re-raised unwrapped.** So that a caller can still catch the type it expected,
+and so that a traceback is not one frame deeper for having gone through a fan-out. One failure is the
+common case and should not be harder to handle than no fan-out at all.
+
+**Why `Exception` and not `BaseException`.** "Collect it and carry on" is right for a listener that
+failed and exactly wrong for a task that has been told to stop.
+
+**On the ordering.** The cache is listed first by convention, so that a read taken after a notification
+cannot return an older version than the notification carried. Today that ordering is *not*
+load-bearing, and the docstring says so rather than claiming a hazard that does not exist: neither
+listener suspends (ADR-030 for the hub, the same rule for `on_change`), so nothing can interleave
+between them and no caller can observe the intermediate state. The convention costs nothing and is the
+order that stays correct on the day one of them grows an `await`.
+
+**Cost accepted.** A caller that wants fail-fast fan-out cannot get it from this helper. Nobody wants
+that here, and the reason is written down.
+
+---
+
+## ADR-048 — `hit_rate` is `None` before any traffic, and the report's key set never changes
+
+**Status:** accepted (slice 4)
+
+**Context.** `as_dict()` feeds slice 5's `/cache` endpoint, which feeds a dashboard.
+
+**Decision.** `hit_rate` returns `None` when no request has been served, not `0.0`. Every counter
+appears in the report on every call, including the zeros. A negative hit counts as a hit for the rate.
+`__repr__` renders a null rate as `-`.
+
+**Why null rather than zero.** A cache with no traffic and a cache that is failing to hit both report 0%
+if the default is zero, and the second one is an incident. A null renders as a gap, which is what "no
+data" should look like — ADR-028's argument applied to a different number.
+
+**Why every key, every time.** An absent key makes a dashboard panel disappear exactly when the thing it
+watches stops happening, which is indistinguishable from the panel being broken. Same reason
+`ProjectionStats` pre-populates every skip reason.
+
+**Why a negative hit counts as a hit.** A served 404 is a store read avoided, which is precisely what
+the rate measures. It is also reported separately, so the two can be told apart.
+
+**Cost accepted.** Consumers must handle a nullable number. That is one `if` in the dashboard query
+against a metric that cannot mislead.

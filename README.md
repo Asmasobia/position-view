@@ -20,20 +20,22 @@ and pinned by a test that its own docstring labels the most important one in the
 
 ## Status
 
-**Slices 1, 2 and 3 of 5 complete** — the pure read-model core, the projector that owns a unit of work
-and a checkpoint, and the fan-out hub that carries changes to live subscribers. The service now folds a
-real stream idempotently and pushes the result to any number of watchers without one of them being able
-to slow it down. No HTTP yet.
+**Slices 1, 2, 3 and 4 of 5 complete** — the pure read-model core, the projector that owns a unit of
+work and a checkpoint, the fan-out hub that carries changes to live subscribers, and a read-through
+cache kept coherent by the change stream rather than by a timeout. The service now folds a real stream
+idempotently, pushes the result to any number of watchers without one of them being able to slow it
+down, and serves repeat reads — including reads for counterparties that do not exist — without touching
+the store. No HTTP yet.
 
 | | Slice | State |
 |---|---|---|
 | 1 | Event contract, money, bucket state machine, pure `project` | ✅ done — 382 tests, 41/41 mutants killed |
 | 2 | Projector + store protocol: atomic apply-and-checkpoint, replay | ✅ done — 444 tests, 32/32 mutants killed |
 | 3 | Subscription fan-out: conflating per-subscriber buffers, bounded | ✅ done — 502 tests, 43/43 mutants killed |
-| 4 | Read-through cache: single-flight, negative caching, invalidation | ⬜ planned |
+| 4 | Read-through cache: single-flight, negative caching, invalidation | ✅ done — 573 tests, 57/57 mutants killed |
 | 5 | HTTP surface: FastAPI, read-your-writes, SSE, health and lag | ⬜ planned |
 
-All three slices so far have no runtime dependencies at all — the whole thing is importable and
+All four slices so far have no runtime dependencies at all — the whole thing is importable and
 testable with nothing installed but the toolchain, and it will run end to end against
 `InMemoryPositionStore`. FastAPI arrives in slice 5, and `tests/test_layering.py` fails the build if it
 drifts inward before then.
@@ -84,6 +86,50 @@ drifts inward before then.
   accident, and the accident-shaped value gets the restrictive reading
   ([ADR-035](DECISIONS.md#adr-035--keysnone-means-every-position-and-keys-means-none)).
 
+### What slice 4 added
+
+- **A cache that deliberately cannot be substituted for the store, pinned by a test.** Five passthrough
+  methods would make `CachedPositions` satisfy `PositionStore`, and then `Projector(CachedPositions(store))`
+  compiles — a projector folding deltas onto a stale base and committing the result as truth. No counter
+  moves, no exception is raised, and the projector's lock cannot help, because the stale value did not
+  come from inside it
+  ([ADR-038](DECISIONS.md#adr-038--the-cache-is-deliberately-not-a-positionstore-and-a-test-pins-its-public-surface)).
+- **Single-flight built on a task plus `asyncio.shield`.** Fifty simultaneous misses on one key become
+  one store read. The `shield` is the part worth copying: with a bare `await` on the shared load, one
+  HTTP client disconnecting cancels the load for every other waiter — intermittent, load-dependent,
+  concentrated on the most popular keys, and invisible to any sequential test
+  ([ADR-040](DECISIONS.md#adr-040--single-flight-is-a-task-register-plus-asyncioshield-not-a-bare-await)).
+- **Absences are cached, which makes `dict.get` unusable for detecting a miss.** Without negative
+  caching, the cheapest way to load this service is to ask about counterparties that do not exist.
+  Caching `None` as a *value* fixes that and creates a trap that reads as tidy code: `.get(key)` returns
+  `None` for both "cached absence" and "not cached", so it silently disables the feature while the
+  counters keep incrementing
+  ([ADR-041](DECISIONS.md#adr-041--an-absence-is-cached-as-a-value-which-makes-dictget-unusable-for-miss-detection)).
+- **No clock, no TTL — coherence comes from the change stream.** The projector already publishes every
+  changed position with its new value, so entries are updated in place and compared by `version`. A TTL
+  is what you use when you cannot know when the value changed; given a precise signal it is strictly
+  worse on both axes at once — staler than necessary *and* more store reads than necessary
+  ([ADR-043](DECISIONS.md#adr-043--invalidation-comes-from-the-change-stream-by-version-there-is-no-clock-and-no-ttl)).
+- **A refresh updates, never inserts, and never promotes.** A cache is populated by reads and updated by
+  writes; never populated by writes. Inserting on notification hands the event stream control of what
+  the cache holds, and promoting on notification makes the hit rate degrade as the *stream* gets busier
+  rather than as the *traffic* changes
+  ([ADR-044](DECISIONS.md#adr-044--a-refresh-updates-in-place-never-inserts-and-never-promotes)).
+- **The classic read-through race, closed twice over.** A change landing while a load is in flight is
+  *held* and version-compared against the store's answer, so neither interleaving loses; and a
+  generation counter — captured when the load is *created*, because `create_task` schedules without
+  starting — stops a load in flight from refilling a cache that has since been cleared
+  ([ADR-045](DECISIONS.md#adr-045--the-read-throughinvalidate-race-is-closed-by-a-held-change-map-and-a-generation-counter)).
+- **A failed read is never cached, and the `except` clause is narrow.** `except Exception: return None`
+  would turn a five-second database wobble into a 404 with real exposure behind it, while the error rate
+  *fell*. `BaseException` would make every orderly shutdown look like an outage
+  ([ADR-046](DECISIONS.md#adr-046--a-failed-read-is-never-cached-and-the-except-clause-is-narrow-on-purpose)).
+- **`combine_listeners`, which runs every listener even when one raises.** Two things now want the same
+  change notification. A bare loop stops at the first failure — so a transient error in the cache costs
+  every live subscriber that update *permanently*, because the retry returns `DUPLICATE` and the
+  notification is never regenerated
+  ([ADR-047](DECISIONS.md#adr-047--combine_listeners-runs-every-listener-then-raises)).
+
 ## Quick start
 
 Requires Python 3.12+.
@@ -91,7 +137,7 @@ Requires Python 3.12+.
 ```bash
 git clone <this repo> && cd position-view
 python -m pip install -e ".[dev]"      # pytest, pytest-asyncio, ruff, mypy, httpx
-python -m pytest                       # 502 tests, about a second — none of them sleep
+python -m pytest                       # 573 tests, about a second — none of them sleep
 python -m ruff check . && python -m ruff format --check .
 python -m mypy --strict src tests
 ```
@@ -104,7 +150,7 @@ There is nothing to serve yet. Slice 5 adds the HTTP surface and a `[serve]` ext
 model/        pure: values, the state machine, the projection step. Standard library only.
 projection/   the store protocol and the loop that owns a unit of work and a checkpoint.
 push/         the fan-out hub: a conflating buffer per subscriber, bounded.
-cache/        read-through, single-flight, invalidated by version.    (slice 4)
+cache/        read-through, single-flight, invalidated by version — never a store.
 api/          FastAPI, SSE, health. The only place a framework appears. (slice 5)
 ```
 
@@ -170,18 +216,29 @@ differently, each with the rejected alternative and the cost accepted. The ones 
   bounded `asyncio.Queue` is the worst of the available options.
 - **[ADR-033](DECISIONS.md)** — the snapshot-to-stream handover, which is the race push APIs get wrong
   most often. Both obvious orderings lose or duplicate data; the fix is one ordering plus one call.
+- **[ADR-038](DECISIONS.md)** — the cache is *not* a store, and a test enforces it, because the refactor
+  that makes it one is small, pleasant to review, and silently wrong about money.
+- **[ADR-041](DECISIONS.md)** / **[ADR-042](DECISIONS.md)** — caching an absence is what makes a
+  nonexistent-key flood cheap to serve, and is also what makes an unbounded cache a memory leak with a
+  remote trigger. The two decisions only make sense together.
+- **[ADR-045](DECISIONS.md)** — the read-through/invalidate race, including the asyncio detail that made
+  the first implementation wrong: `create_task` schedules a coroutine, it does not start it, so state
+  captured on the coroutine's first line is captured *later* than it looks.
+- **[ADR-047](DECISIONS.md)** — why a listener fan-out must not stop at the first failure, worked through
+  to the actual consequence: not a logged error, but one subscriber permanently missing an update.
 
 ## Verification
 
 | Gate | Result |
 |---|---|
-| `pytest` | 502 passed, **0 skipped**, ~0.9s |
+| `pytest` | 573 passed, **0 skipped**, ~1.3s |
 | `ruff check .` | clean (`E W F I B UP ASYNC RUF`, line length 100) |
 | `ruff format --check .` | clean |
 | `mypy --strict src tests` | clean, including `warn_unreachable` |
 | Mutation matrix, slice 1 | **41 / 41 killed**, no survivors |
 | Mutation matrix, slice 2 | **32 / 32 killed**, no survivors — one on the second attempt, see below |
 | Mutation matrix, slice 3 | **43 / 43 killed**, no survivors, first run |
+| Mutation matrix, slice 4 | **57 / 57 killed**, no survivors — after three tests were added and one production line deleted, see below |
 
 ### The mutation matrix
 
@@ -256,6 +313,53 @@ return code waits forever. A hang *is* a failure, so the runner gives each suite
 timeout and counts a timeout as killed. Without that, the two most subtle mutations in the slice could
 not have been measured at all.
 
+Slice 4 is a cache, and a cache is the easiest thing in a service to get wrong without anybody
+noticing, **because every way it can be wrong still returns a plausible value.** Drop single-flight and
+it still answers. Stop caching absences and it still answers. Refill after a clear, promote on refresh,
+count a teardown as a failure — each of those is a green suite and a service that behaves differently
+under load than it does under test. So 57 mutations, almost all of them *relaxations*: one comparison
+widened, one counter silenced, one guard inverted.
+
+| Mutation | What it breaks | Caught by |
+|---|---|---|
+| `asyncio.shield` dropped, the waiter awaits the shared load | One client disconnecting cancels the load for every other waiter on that key | `test_cancelling_one_waiter_does_not_cancel_the_shared_load` |
+| The miss check becomes `dict.get(key) is not None` | Negative caching silently stops working while its counters keep moving | `test_an_absent_position_is_cached_as_an_absence` |
+| The in-flight register is never consulted | A stampede on one key reaches the store in full | `test_fifty_concurrent_misses_produce_one_store_read` |
+| The generation is captured inside `_load` instead of at `create_task` | A `clear()` in the schedule-to-start window is missed, and the load refills the cache it was meant to be discarded by | `test_a_load_in_flight_when_the_cache_is_cleared_does_not_refill_it` |
+| A held change always wins, without the version comparison | The ordinary interleaving — commit before the store read — pushes the cache *backwards* | `test_a_held_change_older_than_the_load_does_not_win` |
+| The held-change comparison is inverted | A change arriving during a load is lost until the next change to that position | `test_a_change_arriving_during_a_load_is_not_lost` |
+| The `finally` no longer clears `_in_flight` | One transient error poisons one counterparty permanently, with a healthy store | `test_a_failed_load_does_not_prevent_the_next_one` |
+| A failed read is answered as an absence | A database wobble becomes a 404 for a counterparty with real exposure, while the error rate *falls* | `test_a_store_failure_is_not_cached_as_an_absence` |
+| `except Exception` widens to `BaseException` | Every orderly shutdown adds to the store-failure count, so a deploy looks like an outage | `test_a_base_exception_is_not_counted_as_a_store_failure` |
+| The done-callback is dropped | asyncio logs "Task exception was never retrieved" at collection time, with a traceback and no request context | `test_an_abandoned_failed_load_does_not_spam_the_event_loops_logger` |
+| The cold-drop check is inverted | The event stream populates the cache and evicts the working set the API is serving | `test_a_change_for_an_uncached_key_is_dropped_rather_than_inserted` |
+| A refresh promotes the entry | Recency comes to mean "recently changed", so the hit rate degrades as the stream gets busier | `test_a_refresh_does_not_promote_an_entry` |
+| The staleness comparison relaxes to `<` | A redelivered notification is counted as a change, hiding the counter that watches for reordering | `test_a_change_at_the_cached_version_is_refused` |
+| The listener fan-out re-raises instead of collecting | A transient failure in the cache costs every live subscriber that update, permanently | `test_combine_listeners_runs_the_rest_when_one_raises` |
+| An untouched cache reports a 0% hit rate | A cache with no traffic and a cache that has stopped hitting look identical | `test_the_hit_rate_is_none_before_any_traffic` |
+| `on_change` gains an `await` | The projector's lock is held across a yield to the event loop | `test_on_change_never_suspends` |
+
+**Three of those 57 are only killed because the matrix was audited before it was run**, and that is the
+part worth passing on: writing the mutation list is itself a review of the tests, and it is cheaper to
+read the list and ask "what would catch this?" than to run 57 suites and read the survivors.
+
+Two mutations had no test at all when they were written down — the missing done-callback, and the
+widened `except` clause. The first was resolved by a throwaway probe before any test was written, since
+"asyncio logs a line when an exception is never retrieved" is a claim about garbage-collection timing and
+a test that cannot actually observe it would be worse than no test. It can be observed: replace the
+loop's exception handler, cancel the only waiter, drop the reference, `gc.collect()`. The second needed a
+`BaseException` that pytest does not treat as a request to abandon the session — a real
+`KeyboardInterrupt` aborts the run instead of asserting anything — so the file defines a one-line
+`Teardown(BaseException)` for it.
+
+**The third was resolved by deleting a line of production code rather than by testing it.** `_remember`
+had a `move_to_end` guarding the "promote an existing entry" case, and that case cannot arise: a hit
+returns early, and single-flight means one load per key, so the method is only ever reached for a key
+that is absent. No test could distinguish the line from its own deletion — which makes it a line that
+has quietly stopped meaning anything, and a future reader would reasonably take its presence as evidence
+that promotion-on-insert matters here. The comment that replaced it says where the promotion that *does*
+matter lives, and where the deliberate lack of one lives.
+
 The matrix is a throwaway script rather than a committed tool: it answers "are these tests
 load-bearing?" once per slice, and a committed mutation runner would be a second thing to maintain for
 a question that is only asked at the end of a slice.
@@ -277,9 +381,10 @@ Test count by file:
 | `test_events.py` | 127 | The wire contract: what is accepted, what is dropped, what is refused |
 | `test_project.py` | 84 | The transition arithmetic, dedup, check order, and a stream fold |
 | `test_positions.py` | 72 | The 16-pair transition table, the version rule, the identity contract |
+| `test_cache.py` | 67 | Single-flight, negative caching, the LRU bound, the invalidate races, the fan-out helper |
 | `test_money.py` | 61 | Exactness, refusals, and the stdlib behaviour the module works around |
 | `test_hub.py` | 54 | Conflation, the handover, the bound, and that `publish` cannot block |
-| `test_layering.py` | 48 | The dependency arrow and the purity of `model/` |
+| `test_layering.py` | 52 | The dependency arrow and the purity of `model/` |
 | `test_projector.py` | 35 | Atomicity, the lock, counter honesty, notification order, replay |
 | `test_store.py` | 21 | One unit of work, the high-water checkpoint, and the shape of the protocol |
 
@@ -289,7 +394,7 @@ under test — so a rule regression would have converted real assertions into sk
 was replaced with an explicit data table plus a completeness cross-check
 ([ADR-017](DECISIONS.md#adr-017--no-test-may-skip-on-a-condition-computed-by-the-code-under-test)).
 
-Three facts in this repository were found by tests rather than by reasoning, and all three are recorded
+Four facts in this repository were found by tests rather than by reasoning, and all four are recorded
 where they were fixed rather than tidied away:
 
 - `Decimal.quantize` rounds silently under the default context. The module's docstring had claimed the
@@ -301,6 +406,11 @@ where they were fixed rather than tidied away:
 - Awaiting a coroutine that never blocks does not yield to the event loop, so two "concurrency" tests
   written against the in-memory store could not see the lock they were named after. The source was
   right; the tests were not. A suspending double fixed them.
+- `asyncio.create_task` schedules a coroutine without starting it, so the cache's generation counter —
+  read on `_load`'s first line — was captured several event-loop ticks *after* the decision to load. A
+  `clear()` landing in that window was invisible to the load, which then refilled the cache it was
+  supposed to have been discarded by. Two tests failed on their first run and both were right: the
+  generation is now captured synchronously and passed in as a parameter.
 
 ## Not what this is
 
