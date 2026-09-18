@@ -998,3 +998,284 @@ stream.
 **Rejected alternative.** A `truncate()` on the protocol guarded by a comment. Rejected on the same
 grounds as the extra write methods: a guarantee that depends on a comment is not a guarantee, and the
 surface test in ADR-020 exists to keep this one from being added quietly.
+
+---
+
+## ADR-030 — The fan-out's `publish` contains no `await`, and a test parses the source to keep it so
+
+**Status:** accepted (slice 3)
+
+**Context.** The projector calls one listener when positions change (ADR-027), under the lock that
+serialises the whole projection (ADR-022). Slice 3 turns that one call into N live subscribers. The
+three-line version of that is `for subscriber in subscribers: await subscriber.send(...)`.
+
+**Decision.** `SubscriptionHub.publish` is `async` in signature and suspends nowhere in its body. It
+drops each changed position into a per-subscriber buffer and returns. The sending happens later, on
+each subscriber's own task. A test parses `hub.py` with `ast` and fails if an `ast.Await` appears
+anywhere inside `publish`.
+
+**Why.** An `await` in that loop is an await on a socket, held under the projection's lock. One
+subscriber on a slow link, one browser tab the OS has suspended, one laptop whose lid closed without
+closing the TCP connection — and the projection stops applying events until the write buffer drains,
+which can be minutes. Every other subscriber then falls behind too, so the symptom presented to an
+operator is "the whole read model is stuck" and the cause is one client nobody can identify from the
+inside.
+
+The structural test rather than a comment, because this is the failure that testing cannot see. Every
+behavioural test in `test_hub.py` would still pass with `await subscriber.send(...)` in the loop:
+in-process doubles never actually block, which is the same lesson ADR-023 paid for once already. The
+guarantee is a property of the source, so the source is what gets checked.
+
+Parsed rather than substring-searched for a specific reason: the word `await` appears throughout the
+module's own prose, including in the paragraph that explains this rule, so `"await" in source` would be
+defeated by its own documentation.
+
+The absence of an `await` buys a second property for free. Nothing can interleave between the first
+iteration of the fan-out loop and the last, so `_subscriptions` cannot be mutated mid-fan-out and needs
+no lock — which is also why `subscribe` and `unsubscribe` are synchronous rather than `async`.
+
+**Cost accepted.** `publish` cannot do anything that requires I/O, so metrics, logging and anything
+else useful have to be either synchronous or moved onto the subscriber's task. Every future maintainer
+who wants to add "just one await" here has to argue with a test.
+
+**Rejected alternative.** A comment reading "do not await here". Rejected on ADR-018's grounds: a
+constraint that only a reader enforces is not enforced, and this one is silent when broken.
+
+---
+
+## ADR-031 — Each subscriber gets a conflating buffer keyed by position, not a queue of events
+
+**Status:** accepted (slice 3)
+
+**Context.** If `publish` cannot send, it has to buffer, and the obvious buffer is
+`asyncio.Queue(maxsize=N)` per subscriber.
+
+**Decision.** The buffer is a `dict[PositionKey, Position]`. A second update for a position *replaces*
+the buffered one rather than queueing behind it. The replacement is counted as `conflated`.
+
+**Why.** A queue is a backlog of events; what is being published is *state*. A subscriber that is 500
+updates behind on a position does not want the 500 intermediate versions — every one of them is
+superseded by the time it arrives, and each costs memory to hold, bandwidth to send and CPU on the
+client to apply. It wants the current version.
+
+The decisive argument is what the two shapes are bounded *by*. A queue's occupancy is bounded by the
+event rate, so a subscriber can be made to fall behind by volume alone, and a burst on one instruction
+can evict a client watching an entirely different counterparty. A conflating buffer's occupancy is
+bounded by the number of distinct positions the subscriber watches — so a client watching one
+counterparty holds at most one entry no matter how many events arrive. A thousand publishes for one
+position leave one entry.
+
+A bounded queue also has no acceptable behaviour when it fills. Blocking the producer is forbidden
+(ADR-030). Dropping is the only alternative, and `asyncio.Queue` drops the *newest* item, which is the
+worst of every option: the subscriber keeps a stale backlog and loses precisely the update it needed.
+
+This is only legitimate because of ADR-009 and ADR-022 together. `Position.version` moves only when
+observable content changes, and the projector publishes under a lock, so per-position publish order is
+version order — which makes "the last one wins" identical to "the newest one wins". If the payload were
+an event stream rather than versioned state, conflation would be data loss, and this decision would be
+wrong.
+
+**Cost accepted.** A subscriber cannot see intermediate states, so the hub cannot be used to drive
+anything that needs every transition — an audit trail, or a client animating each change. Those want
+the event stream, which is upstream of this service and still available.
+
+---
+
+## ADR-032 — Overflow disconnects the subscriber rather than delivering a subset
+
+**Status:** accepted (slice 3)
+
+**Context.** Conflation bounds a buffer by *distinct positions watched*, which is unbounded for a
+subscriber that asked for all of them. A wildcard subscriber that stops reading will eventually hold an
+entry per position in the book.
+
+**Decision.** Past `max_pending` distinct positions, the subscription is marked `overflowed`, its
+buffer is discarded in full, and the next drain raises `SubscriberOverflow`. The flag is never cleared:
+overflow is terminal, not a throttle. The hub counts the transition once per subscriber, in
+`overflow_disconnects`.
+
+**Why.** The tempting alternative is to keep what fits and carry on. That sends the client a subset of
+the changes with nothing indicating anything was dropped, so its view of the dropped positions freezes
+at an old version while the others keep updating — which is indistinguishable from those positions
+having genuinely stopped changing, a real and interesting state. The client is then wrong and
+confident, which is the worst state this service can put a consumer in, and it is exactly the
+failure mode ADR-007 exists to prevent one layer down.
+
+Failing loudly is cheap by comparison. A client that knows it has lost data re-snapshots and is correct
+again, and SSE reconnects on its own, so the recovery path is one the client already has. Discarding
+the buffer rather than trimming it is part of the same argument: a partial buffer is *delivered as
+though it were complete*, so keeping it converts a detected loss back into a silent one.
+
+Terminal rather than resumable for the same reason. Letting an overflowed subscription start buffering
+again would hand the client a stream with a hole in it and no marker where the hole is.
+
+Worth stating what this does *not* do: a subscriber watching a fixed set of keys with `max_pending` at
+or above that count cannot overflow, however long it stops reading. That is what makes disconnection an
+acceptable response — the only clients it can reach are wildcard subscribers that have stopped
+reading, which is either a client bug or a sign the wildcard subscription was the wrong shape for what
+they are doing.
+
+**Cost accepted.** `max_pending` is a guess. It is deliberately a guess with a stated shape — more
+positions than a human dashboard shows at once, far fewer than a whole book — rather than a tuned
+number, because the value only matters for the clients that should be disconnected anyway.
+
+---
+
+## ADR-033 — A subscription is registered before the snapshot is read, and `mark_delivered` closes the gap
+
+**Status:** accepted (slice 3)
+
+**Context.** A client needs the current state and then every change after it. Both obvious orderings
+are wrong, and this is the race that push APIs get wrong most often.
+
+  - Snapshot, then subscribe: every change between the two is lost permanently, and the client's view
+    of those positions is frozen with nothing to indicate it.
+  - Subscribe, then snapshot: nothing is lost, but the client receives updates its snapshot already
+    contains and cannot tell a stale duplicate from a new change.
+
+**Decision.** Subscribe first, read the snapshot, then call `Subscription.mark_delivered(snapshot)`
+before streaming. `mark_delivered` raises a per-position watermark of the highest version already sent;
+a drain then drops every buffered position whose version is not *strictly* greater. The watermark moves
+with `max`, never by assignment.
+
+**Why.** Registering first means the buffer starts filling immediately, so no change can slip through
+the gap — that closes the first failure. `mark_delivered` then makes the resulting overlap harmless
+rather than visible, which closes the second. Together the client receives every version exactly once,
+in order, with no gap and no duplicate, and neither half works without the other.
+
+The watermark is a `version` and not a timestamp, and that is load-bearing: two changes within the same
+clock tick would be indistinguishable, so the second would be suppressed as a duplicate. It rests on
+ADR-009 — a version bump means the content changed — and on ADR-022, which is what makes per-key
+version order the same as per-key publish order.
+
+`max` rather than assignment because two overlapping snapshot reads can complete out of order, and
+lowering the watermark would resend a version the client had already applied.
+
+The test suite carries an explicit negative control: the same sequence *without* `mark_delivered`,
+asserting that version 1 is then delivered twice. Without it, deleting the call from the hub would
+leave every other assertion in the file still passing.
+
+**Cost accepted.** The connection handler has to run three steps in the right order, and getting them
+wrong is not a type error. The context manager and the ordering test are the mitigation; a single
+`subscribe_and_snapshot` helper would be better still and belongs in slice 5, where the store read
+lives.
+
+---
+
+## ADR-034 — The wakeup is an `asyncio.Event`, and `drain` never returns an empty batch
+
+**Status:** accepted (slice 3)
+
+**Context.** The buffer holds the data, so the subscriber's task needs a way to learn there is
+something in it. The choices are a queue (which would carry the data too), a condition variable, or an
+event.
+
+**Decision.** One `asyncio.Event` per subscription, set by `offer` and cleared by a drain. `drain`
+loops: it waits, takes, and only returns when the batch is non-empty. `drain_nowait` is the
+non-blocking half and *may* return an empty tuple.
+
+**Why.** An event carries no payload and needs no bound, which is exactly right when the payload is
+already in the buffer — it is a doorbell, and a doorbell rung twice before anyone answers is one visit.
+That collapse is a feature: it is what makes a burst of publishes cost one wakeup rather than N.
+
+The loop is not defensive padding; the empty wakeup is reachable in two ordinary ways. A publish whose
+version the snapshot already covered rings the bell and yields nothing (ADR-033). Two publishes in
+quick succession ring it twice and the first drain takes both. Without the loop, `drain` returns `()`,
+and slice 5's `async for` writes an empty frame down a socket — or worse, a caller reads `()` as
+end-of-stream.
+
+`drain_nowait` exists as well as `drain` because the tests need to assert "nothing was delivered"
+without waiting for a timeout, and asserting on the absence of an event is otherwise a choice between a
+sleep and a flaky test. It is also the shape slice 5 wants for the initial catch-up read.
+
+**Cost accepted.** Two drain methods with subtly different contracts — one may return empty, one may
+not. The names carry the difference and the docstrings state it, but a caller can still pick the wrong
+one.
+
+---
+
+## ADR-035 — `keys=None` means every position and `keys=[]` means none
+
+**Status:** accepted (slice 3)
+
+**Context.** A subscriber either watches specific positions or all of them, and the filter has to
+express both.
+
+**Decision.** `None` means every position. A set — including the empty set — means exactly those keys.
+An empty key set therefore receives nothing.
+
+**Why.** An empty list is what a caller produces *by accident*: a filter that matched nothing, a query
+parameter that parsed to an empty list, a lookup that returned no keys. Treating that as a wildcard
+would stream an entire book to a client that asked for nothing — both an exposure and, per ADR-032, the
+only subscription shape that can overflow. `None` has to be passed deliberately and cannot arrive from
+an empty collection.
+
+The general form of the rule is worth keeping: when a permissive and a restrictive reading of the same
+value are both plausible, the accident-shaped value should get the restrictive one.
+
+Filtering lives on the subscription rather than in a key-to-subscribers index on the hub. With a
+handful of subscribers a membership test per subscriber beats maintaining an index across every
+subscribe and unsubscribe, and the fan-out loop stays honest — it visits every subscriber exactly once
+and cannot skip one because an index was stale.
+
+**Cost accepted.** Fan-out is O(subscribers × positions per batch). At thousands of subscribers the
+index becomes the right trade, and this is the decision to revisit first.
+
+---
+
+## ADR-036 — Overflow raises and closing returns, so a stream's two endings are distinguishable
+
+**Status:** accepted (slice 3)
+
+**Context.** A subscription's stream ends in two ways: the client disconnected, or the client fell too
+far behind and lost data. Both terminate the iteration.
+
+**Decision.** `Subscription.updates()` returns normally when the subscription is closed and propagates
+`SubscriberOverflow` when it overflowed. `drain_nowait` raises `SubscriptionClosed` rather than
+returning `()` on a closed subscription.
+
+**Why.** If both endings returned, the handler could not tell them apart, and the only correct response
+to the second — tell the client to re-snapshot — would never happen. A data-loss event would be
+indistinguishable from a browser tab closing, which is the most common event in the system.
+
+Same argument for `SubscriptionClosed` versus an empty tuple: "the stream has ended" and "there is
+nothing new right now" are different facts, and a caller that confuses them either spins or hangs. This
+is the mirror image of ADR-008 — there, a *routine* outcome was made a returned value rather than an
+exception; here an *unrecoverable* one is made an exception rather than a returned value. The principle
+is the same in both directions: the type should tell the caller whether carrying on is an option.
+
+**Cost accepted.** Two exception types in a module whose whole job is to not raise. Both are raised on
+the subscriber's own task, never on the projection's, so neither can reach the projector.
+
+---
+
+## ADR-037 — The hub holds `Position` objects, and a subscription is a context manager
+
+**Status:** accepted (slice 3)
+
+**Context.** Two smaller decisions, both about where a responsibility sits.
+
+**Decision.** The buffer holds `Position` model objects, not serialised frames. `SubscriptionHub`
+offers a `subscription()` context manager that unsubscribes in a `finally`, and `publish` prunes
+subscriptions that were closed without being unsubscribed.
+
+**Why — the model object.** Serialising once in the hub would be cheaper than once per subscriber, and
+it is still wrong: it would force a wire format on a layer that `test_layering.py` allows no
+third-party imports, and slice 4's cache and slice 5's serialiser both want the object. Conflation also
+needs `key` and `version`, which a frame would have to carry separately or be re-parsed for.
+
+**Why — the context manager.** The caller is a connection handler, and a connection handler almost
+never ends by reaching its last line. It ends with a `CancelledError` when the client disconnects, or
+with an exception from a socket write. `finally` is the only construct that survives both — a
+`try/except Exception` would miss cancellation, which is how *every* real SSE connection ends. Putting
+it in the hub means every call site gets it rather than the one that remembered.
+
+A leaked subscription is not a small leak: it keeps buffering forever, holding `Position` objects alive
+for positions nobody is watching and being visited on every publish. The prune in `publish` is the
+second line of defence, for a subscription closed directly without going through `unsubscribe`. It is
+guarded by an `any(...)` check so the common case — nothing closed — costs a scan rather than a rebuilt
+list.
+
+**Cost accepted.** The prune scans the subscriber list on every publish. It is O(subscribers) against a
+fan-out that is already O(subscribers × positions), so it changes nothing asymptotically, and it is the
+same list the loop below it walks anyway.

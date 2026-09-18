@@ -20,21 +20,23 @@ and pinned by a test that its own docstring labels the most important one in the
 
 ## Status
 
-**Slices 1 and 2 of 5 complete** — the pure read-model core, plus the projector that owns a unit of
-work and a checkpoint. The service now folds a real stream idempotently. No HTTP and no fan-out yet.
+**Slices 1, 2 and 3 of 5 complete** — the pure read-model core, the projector that owns a unit of work
+and a checkpoint, and the fan-out hub that carries changes to live subscribers. The service now folds a
+real stream idempotently and pushes the result to any number of watchers without one of them being able
+to slow it down. No HTTP yet.
 
 | | Slice | State |
 |---|---|---|
 | 1 | Event contract, money, bucket state machine, pure `project` | ✅ done — 382 tests, 41/41 mutants killed |
 | 2 | Projector + store protocol: atomic apply-and-checkpoint, replay | ✅ done — 444 tests, 32/32 mutants killed |
-| 3 | Subscription fan-out: bounded per-subscriber queues, conflation | ⬜ planned |
+| 3 | Subscription fan-out: conflating per-subscriber buffers, bounded | ✅ done — 502 tests, 43/43 mutants killed |
 | 4 | Read-through cache: single-flight, negative caching, invalidation | ⬜ planned |
 | 5 | HTTP surface: FastAPI, read-your-writes, SSE, health and lag | ⬜ planned |
 
-Both slices so far have no runtime dependencies at all — the whole thing is importable and testable
-with nothing installed but the toolchain, and it will run end to end against `InMemoryPositionStore`.
-FastAPI arrives in slice 5, and `tests/test_layering.py` fails the build if it drifts inward before
-then.
+All three slices so far have no runtime dependencies at all — the whole thing is importable and
+testable with nothing installed but the toolchain, and it will run end to end against
+`InMemoryPositionStore`. FastAPI arrives in slice 5, and `tests/test_layering.py` fails the build if it
+drifts inward before then.
 
 ### What slice 2 added
 
@@ -57,6 +59,31 @@ then.
   grows by a second per second on an idle stream
   ([ADR-028](DECISIONS.md#adr-028--the-projection-publishes-staleness-and-a-watermark-never-a-number-called-lag)).
 
+### What slice 3 added
+
+- **A fan-out whose `publish` contains no `await` — enforced by parsing the source.** It runs under the
+  projector's lock, so an `await` on a subscriber's socket there stops the entire projection until that
+  one client's TCP buffer drains. Every behavioural test in the file would still pass with the bug in
+  place, because in-process doubles never block, so the guarantee is checked structurally
+  ([ADR-030](DECISIONS.md#adr-030--the-fan-outs-publish-contains-no-await-and-a-test-parses-the-source-to-keep-it-so)).
+- **A conflating buffer per subscriber, not a queue.** Keyed by position, so a newer version replaces an
+  older one and a subscriber's memory is bounded by *how many positions it watches* rather than by the
+  event rate. A thousand updates to one position leave one entry. Only legitimate because the payload is
+  versioned state and not an event stream
+  ([ADR-031](DECISIONS.md#adr-031--each-subscriber-gets-a-conflating-buffer-keyed-by-position-not-a-queue-of-events)).
+- **Overflow disconnects instead of degrading.** A trimmed buffer is delivered as though it were
+  complete, which freezes the client's view of the dropped positions with nothing to indicate it — wrong
+  and confident. A client that knows it lost data re-snapshots and is right again
+  ([ADR-032](DECISIONS.md#adr-032--overflow-disconnects-the-subscriber-rather-than-delivering-a-subset)).
+- **The snapshot-then-stream handover, done in the only order that works.** Subscribe first (so nothing
+  slips through the gap), then snapshot, then `mark_delivered(snapshot)` to suppress what the client
+  already has. Both obvious orderings are broken — one by a gap, one by duplicates — and there is a
+  negative-control test asserting the duplicate appears when the call is removed
+  ([ADR-033](DECISIONS.md#adr-033--a-subscription-is-registered-before-the-snapshot-is-read-and-mark_delivered-closes-the-gap)).
+- **`keys=None` means every position; `keys=[]` means none.** An empty list is what a caller produces by
+  accident, and the accident-shaped value gets the restrictive reading
+  ([ADR-035](DECISIONS.md#adr-035--keysnone-means-every-position-and-keys-means-none)).
+
 ## Quick start
 
 Requires Python 3.12+.
@@ -64,7 +91,7 @@ Requires Python 3.12+.
 ```bash
 git clone <this repo> && cd position-view
 python -m pip install -e ".[dev]"      # pytest, pytest-asyncio, ruff, mypy, httpx
-python -m pytest                       # 444 tests, well under a second — none of them sleep
+python -m pytest                       # 502 tests, about a second — none of them sleep
 python -m ruff check . && python -m ruff format --check .
 python -m mypy --strict src tests
 ```
@@ -76,7 +103,7 @@ There is nothing to serve yet. Slice 5 adds the HTTP surface and a `[serve]` ext
 ```
 model/        pure: values, the state machine, the projection step. Standard library only.
 projection/   the store protocol and the loop that owns a unit of work and a checkpoint.
-push/         the fan-out hub: snapshot then stream, per subscriber.  (slice 3)
+push/         the fan-out hub: a conflating buffer per subscriber, bounded.
 cache/        read-through, single-flight, invalidated by version.    (slice 4)
 api/          FastAPI, SSE, health. The only place a framework appears. (slice 5)
 ```
@@ -138,17 +165,23 @@ differently, each with the rejected alternative and the cost accepted. The ones 
 - **[ADR-026](DECISIONS.md)** — an undecodable message does not advance the checkpoint, and the choice
   between dead-lettering it and stalling the partition is handed back to the caller rather than made
   silently by a `try/except` that logs.
+- **[ADR-031](DECISIONS.md)** — the fan-out buffer conflates by position instead of queueing events, so a
+  subscriber's memory is bounded by what it watches rather than by how busy the stream is. Includes why a
+  bounded `asyncio.Queue` is the worst of the available options.
+- **[ADR-033](DECISIONS.md)** — the snapshot-to-stream handover, which is the race push APIs get wrong
+  most often. Both obvious orderings lose or duplicate data; the fix is one ordering plus one call.
 
 ## Verification
 
 | Gate | Result |
 |---|---|
-| `pytest` | 444 passed, **0 skipped**, ~0.6s |
+| `pytest` | 502 passed, **0 skipped**, ~0.9s |
 | `ruff check .` | clean (`E W F I B UP ASYNC RUF`, line length 100) |
 | `ruff format --check .` | clean |
 | `mypy --strict src tests` | clean, including `warn_unreachable` |
 | Mutation matrix, slice 1 | **41 / 41 killed**, no survivors |
 | Mutation matrix, slice 2 | **32 / 32 killed**, no survivors — one on the second attempt, see below |
+| Mutation matrix, slice 3 | **43 / 43 killed**, no survivors, first run |
 
 ### The mutation matrix
 
@@ -197,6 +230,32 @@ mutation is now killed, and the whole episode is written up in
 That is the argument for mutation testing in one paragraph. Review would not have caught it — the tests
 looked right, were named right, and passed.
 
+Slice 3's claims are mostly about *absence* — no `await` in the publish path, no unbounded buffer, no
+version delivered twice, no leaked subscription — so almost all 43 of its mutations are deletions or
+one-token relaxations: the changes somebody makes while removing what looks like defensive clutter.
+
+| Mutation | What it breaks | Caught by |
+|---|---|---|
+| `mark_delivered` records nothing | Every client is resent the whole snapshot as though it were news | `test_the_handover_has_neither_a_gap_nor_a_duplicate` |
+| The delivered watermark is assigned rather than `max`'d | A late snapshot re-opens a version the client already applied | `test_mark_delivered_never_moves_the_watermark_backwards` |
+| Suppression becomes strict (`<` for `<=`) | Every duplicate in an at-least-once stream reaches the client | `test_the_same_version_twice_is_suppressed` |
+| Nothing is ever suppressed | A late publish moves the client's view of a position backwards | `test_a_version_already_delivered_is_not_delivered_again` |
+| The bound becomes `>=` | A subscriber is cut off for holding exactly what it was allowed | `test_the_bound_is_inclusive` |
+| The bound never fires | A wildcard subscriber that stops reading grows without limit | `test_a_wildcard_subscriber_that_stops_reading_eventually_overflows` |
+| The buffer is read without being cleared | Every position ever seen is held for the life of the connection | `test_a_newer_version_replaces_a_buffered_older_one` |
+| `drain` stops looping | A suppressed-only wakeup resolves it with an empty batch, which slice 5 would write down a socket | `test_drain_never_returns_an_empty_batch` |
+| An overflow ends `updates()` quietly | Losing data becomes indistinguishable from a closed tab | `test_updates_propagates_an_overflow_instead_of_ending_quietly` |
+| The context manager cleans up only on `Exception` | Every cancelled connection — which is all of them — leaks a subscription | `test_the_context_manager_unsubscribes_on_cancellation` |
+| `keys=[]` is promoted to a wildcard | A client that asked for nothing is streamed the whole book | `test_an_empty_key_set_receives_nothing_rather_than_everything` |
+
+**Two of slice 3's mutations make the suite hang rather than fail**, and that is worth writing down
+because it changes the tool. Dropping `_wakeup.clear()` turns `drain` into a tight loop that never
+yields; dropping `_wakeup.set()` from `close` parks a reader on an event nobody will ever set. Neither
+produces a failing assertion — the process simply stops making progress, and a matrix that waits for a
+return code waits forever. A hang *is* a failure, so the runner gives each suite run a subprocess
+timeout and counts a timeout as killed. Without that, the two most subtle mutations in the slice could
+not have been measured at all.
+
 The matrix is a throwaway script rather than a committed tool: it answers "are these tests
 load-bearing?" once per slice, and a committed mutation runner would be a second thing to maintain for
 a question that is only asked at the end of a slice.
@@ -219,7 +278,8 @@ Test count by file:
 | `test_project.py` | 84 | The transition arithmetic, dedup, check order, and a stream fold |
 | `test_positions.py` | 72 | The 16-pair transition table, the version rule, the identity contract |
 | `test_money.py` | 61 | Exactness, refusals, and the stdlib behaviour the module works around |
-| `test_layering.py` | 44 | The dependency arrow and the purity of `model/` |
+| `test_hub.py` | 54 | Conflation, the handover, the bound, and that `publish` cannot block |
+| `test_layering.py` | 48 | The dependency arrow and the purity of `model/` |
 | `test_projector.py` | 35 | Atomicity, the lock, counter honesty, notification order, replay |
 | `test_store.py` | 21 | One unit of work, the high-water checkpoint, and the shape of the protocol |
 
