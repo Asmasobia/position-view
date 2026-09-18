@@ -20,20 +20,42 @@ and pinned by a test that its own docstring labels the most important one in the
 
 ## Status
 
-**Slice 1 of 5 complete** — the pure read-model core: the event contract, money, the position state
-machine, and the projection step. No storage, no HTTP, no fan-out yet.
+**Slices 1 and 2 of 5 complete** — the pure read-model core, plus the projector that owns a unit of
+work and a checkpoint. The service now folds a real stream idempotently. No HTTP and no fan-out yet.
 
 | | Slice | State |
 |---|---|---|
 | 1 | Event contract, money, bucket state machine, pure `project` | ✅ done — 382 tests, 41/41 mutants killed |
-| 2 | Projector + store protocol: atomic apply-and-checkpoint, replay | ⬜ planned |
+| 2 | Projector + store protocol: atomic apply-and-checkpoint, replay | ✅ done — 444 tests, 32/32 mutants killed |
 | 3 | Subscription fan-out: bounded per-subscriber queues, conflation | ⬜ planned |
 | 4 | Read-through cache: single-flight, negative caching, invalidation | ⬜ planned |
 | 5 | HTTP surface: FastAPI, read-your-writes, SSE, health and lag | ⬜ planned |
 
-Slice 1 has no runtime dependencies at all — it is importable and testable with nothing installed but
-the toolchain. FastAPI arrives in slice 5, and `tests/test_layering.py` fails the build if it drifts
-inward before then.
+Both slices so far have no runtime dependencies at all — the whole thing is importable and testable
+with nothing installed but the toolchain, and it will run end to end against `InMemoryPositionStore`.
+FastAPI arrives in slice 5, and `tests/test_layering.py` fails the build if it drifts inward before
+then.
+
+### What slice 2 added
+
+- **`PositionStore`, a protocol with exactly one write method.** `commit(WriteBatch)`, and nothing
+  else. Atomicity is expressed as a type rather than as a rule, so the three-call sequence that leaves
+  money counted in one bucket and remembered in another is unwritable rather than merely discouraged
+  ([ADR-020](DECISIONS.md#adr-020--the-store-protocol-has-exactly-one-write-method)).
+- **A checkpoint that is a high-water mark**, not "the last event handled", with a counter for the
+  batch that would have moved it backwards — because clamping is right and clamping *silently* destroys
+  the only evidence that delivery order broke
+  ([ADR-024](DECISIONS.md#adr-024--the-checkpoint-is-a-high-water-mark-and-a-regression-is-counted-rather-than-raised)).
+- **One lock across read → decide → write → notify.** With an async store, applying an event is
+  read-modify-write across suspension points, and the lost update it invites is silent in both
+  directions: money missing, or one instruction counted twice
+  ([ADR-022](DECISIONS.md#adr-022--one-asynciolock-is-held-across-read--project--commit--notify)).
+- **Counters that only move after the commit returns**, so a failing database produces a flat line
+  instead of a rising one
+  ([ADR-025](DECISIONS.md#adr-025--every-counter-is-incremented-after-the-commit-returns-and-a-refusal-is-the-exception)).
+- **Two raw facts instead of a metric called "lag"**, since `now - last_event_at` is staleness and
+  grows by a second per second on an idle stream
+  ([ADR-028](DECISIONS.md#adr-028--the-projection-publishes-staleness-and-a-watermark-never-a-number-called-lag)).
 
 ## Quick start
 
@@ -42,7 +64,7 @@ Requires Python 3.12+.
 ```bash
 git clone <this repo> && cd position-view
 python -m pip install -e ".[dev]"      # pytest, pytest-asyncio, ruff, mypy, httpx
-python -m pytest                       # 382 tests, well under a second — none of them sleep
+python -m pytest                       # 444 tests, well under a second — none of them sleep
 python -m ruff check . && python -m ruff format --check .
 python -m mypy --strict src tests
 ```
@@ -53,7 +75,7 @@ There is nothing to serve yet. Slice 5 adds the HTTP surface and a `[serve]` ext
 
 ```
 model/        pure: values, the state machine, the projection step. Standard library only.
-projection/   the loop that owns a transaction and a checkpoint.      (slice 2)
+projection/   the store protocol and the loop that owns a unit of work and a checkpoint.
 push/         the fan-out hub: snapshot then stream, per subscriber.  (slice 3)
 cache/        read-through, single-flight, invalidated by version.    (slice 4)
 api/          FastAPI, SSE, health. The only place a framework appears. (slice 5)
@@ -108,22 +130,32 @@ differently, each with the rejected alternative and the cost accepted. The ones 
   the *same object*. Everything in slices 3–5 is built on that.
 - **[ADR-008](DECISIONS.md)** — "skipped" is a returned value, because the version of the exception-based
   loop that forgets to advance the checkpoint reprocesses the same event forever.
+- **[ADR-020](DECISIONS.md)** — the store has one write method, so a partial write is not a bug to avoid
+  but a state the interface cannot express. Includes what each half of a partial write actually costs.
+- **[ADR-023](DECISIONS.md)** — the one that is worth reading even if you never look at this code again:
+  a concurrency test against an in-memory double proves nothing, because awaiting a coroutine that
+  never blocks is not a suspension point. Found by mutation testing, not by review.
+- **[ADR-026](DECISIONS.md)** — an undecodable message does not advance the checkpoint, and the choice
+  between dead-lettering it and stalling the partition is handed back to the caller rather than made
+  silently by a `try/except` that logs.
 
 ## Verification
 
 | Gate | Result |
 |---|---|
-| `pytest` | 382 passed, **0 skipped**, ~0.35s |
+| `pytest` | 444 passed, **0 skipped**, ~0.6s |
 | `ruff check .` | clean (`E W F I B UP ASYNC RUF`, line length 100) |
 | `ruff format --check .` | clean |
 | `mypy --strict src tests` | clean, including `warn_unreachable` |
-| Mutation matrix | **41 / 41 killed**, no survivors |
+| Mutation matrix, slice 1 | **41 / 41 killed**, no survivors |
+| Mutation matrix, slice 2 | **32 / 32 killed**, no survivors — one on the second attempt, see below |
 
 ### The mutation matrix
 
-A passing test suite proves the tests run, not that they check anything. So slice 1 was verified by
-introducing 41 single-token changes to the source — each one a mistake a careless author could plausibly
-have made — and confirming the suite fails for every one of them. Among them:
+A passing test suite proves the tests run, not that they check anything. So each slice is verified by
+introducing changes to the source — each one a mistake a careless author could plausibly have made —
+and confirming the suite fails for every one of them. Slice 1's 41 mutations were single-token
+arithmetic and validation swaps. Among them:
 
 | Mutation | First test that catches it | Total failures |
 |---|---|---:|
@@ -135,6 +167,35 @@ have made — and confirming the suite fails for every one of them. Among them:
 | The ordering check becomes inclusive, so a duplicate reports as out-of-order | `test_an_older_event_is_out_of_order_and_not_a_duplicate` | 4 |
 | `event_id` 0 is accepted, colliding with the empty-checkpoint sentinel | `test_zero_and_negatives_are_refused[0]` | 1 |
 | A cross-position move emits one change instead of two | `test_a_corrected_counterparty_produces_two_changes` | 5 |
+
+Slice 2's claims are of a different kind — atomicity, ordering, counter honesty, notification order —
+so its 32 mutations are mostly *structural*: the changes somebody makes while tidying up.
+
+| Mutation | What it breaks | Caught by |
+|---|---|---|
+| `async with self._lock` deleted | Concurrent events on one position lose updates silently | `test_the_lock_is_what_makes_a_suspending_store_safe` |
+| The counters move **before** `commit` | A retrying consumer makes a failing database look busy | `test_a_failed_commit_leaves_no_trace_in_the_store_or_the_counters` |
+| The listener is called **before** `commit` | Subscribers are told about a version that then fails to exist | the listener's own `durable is position` assertion |
+| `max(...)` becomes assignment on the checkpoint | A late event rewinds progress; every lag graph is meaningless | `test_the_checkpoint_never_moves_backwards` |
+| `<` becomes `<=` on the regression check | Every ordinary duplicate reports a broken ordering guarantee | `test_re_committing_the_same_checkpoint_is_not_a_regression` |
+| A skipped event commits no checkpoint | A poison event is re-read forever, and lag climbs in a straight line | `test_a_skipped_event_still_advances_the_checkpoint` |
+| `is not` becomes always-true in the fold | An unchanged row is rewritten and every subscriber woken for nothing | `test_a_no_op_transition_advances_the_snapshot_and_writes_no_position` |
+| The duplicate-key guard never fires | Half a cross-position move is discarded with no evidence | `test_a_batch_touching_one_position_twice_is_refused` |
+| A miss returns an empty `Position` instead of `None` | Every misspelt counterparty looks real, with nothing outstanding | `test_an_untouched_position_is_absent_rather_than_zeroed` |
+
+**One of those 32 survived the first run, and it was the most important one.** Deleting the lock left
+all 441 tests green — including the two named "concurrent". The reason is a fact about asyncio worth
+carrying to other codebases: **awaiting a coroutine is not a suspension point.** `await` on a coroutine
+that never itself blocks runs start to finish on the current task without a trip through the event loop,
+and `InMemoryPositionStore` is three dict operations with no `await` in them. So no test using it could
+possibly observe the lock — those two were pinning the fold under `asyncio.gather`, which is worth
+pinning and is not what they claimed. The fix was a second double whose every method yields
+(`asyncio.sleep(0)`, the minimal faithful model of a database round trip) and three tests over it; the
+mutation is now killed, and the whole episode is written up in
+[ADR-023](DECISIONS.md#adr-023--a-test-double-that-suspends-because-the-shipped-store-does-not).
+
+That is the argument for mutation testing in one paragraph. Review would not have caught it — the tests
+looked right, were named right, and passed.
 
 The matrix is a throwaway script rather than a committed tool: it answers "are these tests
 load-bearing?" once per slice, and a committed mutation runner would be a second thing to maintain for
@@ -158,7 +219,9 @@ Test count by file:
 | `test_project.py` | 84 | The transition arithmetic, dedup, check order, and a stream fold |
 | `test_positions.py` | 72 | The 16-pair transition table, the version rule, the identity contract |
 | `test_money.py` | 61 | Exactness, refusals, and the stdlib behaviour the module works around |
-| `test_layering.py` | 38 | The dependency arrow and the purity of `model/` |
+| `test_layering.py` | 44 | The dependency arrow and the purity of `model/` |
+| `test_projector.py` | 35 | Atomicity, the lock, counter honesty, notification order, replay |
+| `test_store.py` | 21 | One unit of work, the high-water checkpoint, and the shape of the protocol |
 
 **Zero skips is a deliberate property, not a coincidence.** An earlier version of the invariant tests
 reported "83 passed, 34 skipped" because it called `pytest.skip` on a condition computed by the function
@@ -166,8 +229,8 @@ under test — so a rule regression would have converted real assertions into sk
 was replaced with an explicit data table plus a completeness cross-check
 ([ADR-017](DECISIONS.md#adr-017--no-test-may-skip-on-a-condition-computed-by-the-code-under-test)).
 
-Two facts in this repository were found by tests rather than by reasoning, and both are recorded where
-they were fixed rather than tidied away:
+Three facts in this repository were found by tests rather than by reasoning, and all three are recorded
+where they were fixed rather than tidied away:
 
 - `Decimal.quantize` rounds silently under the default context. The module's docstring had claimed the
   opposite; the implementation was rewritten around a trapping `Context`. This was a genuine money
@@ -175,6 +238,9 @@ they were fixed rather than tidied away:
 - `1 == 1.0` and `1 == True` are both true, so a bare `!=` accepted `{"schema_version": 1.0}` and
   `{"schema_version": true}` as compatible versions. The source was fixed and the test that caught it
   is named after having caught it.
+- Awaiting a coroutine that never blocks does not yield to the event loop, so two "concurrency" tests
+  written against the in-memory store could not see the lock they were named after. The source was
+  right; the tests were not. A suspending double fixed them.
 
 ## Not what this is
 

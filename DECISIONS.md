@@ -647,3 +647,354 @@ defined rather than discovered later.
 `ILLEGAL_TRANSITION`. Tempting, because the projection gets simpler and the counter would at least be
 non-zero. Rejected because a booking correction is an ordinary business event, not a producer bug, and
 classifying it as a bug trains people to ignore the counter that also reports real bugs.
+
+---
+
+## ADR-020 — The store protocol has exactly one write method
+
+**Status:** accepted (slice 2)
+
+**Context.** Applying one event changes three things: zero to two position rows, one instruction
+snapshot, and the checkpoint. The obvious interface offers a method for each — `save_position`,
+`save_snapshot`, `set_checkpoint` — and each one is individually useful, most obviously to a rebuild
+script that wants to write positions without inventing snapshots.
+
+**Decision.** `PositionStore` exposes five reads and **one** write: `commit(WriteBatch)`. There is no
+`save_position`, no `save_snapshot`, no `set_checkpoint`, no `delete` and no `truncate`. A test named
+`test_the_protocol_offers_exactly_one_way_to_write` pins the method set, so widening it is a decision
+somebody has to make in a test rather than a two-line addition to a protocol nobody re-reads.
+
+**Why.** Atomicity stops being a rule people remember and becomes a property of the type. The
+dangerous version of the code is not merely discouraged, it is unwritable:
+
+```
+await store.save_position(new_position)      # crash here
+await store.save_snapshot(new_snapshot)
+await store.set_checkpoint(envelope.event_id)
+```
+
+Crash on the first line and the projection has counted the money in the new bucket while its memory of
+the instruction still says the money is in the old one — so the next event for that instruction undoes
+the *old* bucket a second time and the projection is wrong in two buckets at once, permanently, with
+nothing raised. Crash after the third line but before the first and the checkpoint has moved past an
+event that was never applied; the money is gone and no replay will find it, because replay starts from
+the checkpoint. Both are silent, and both reconcile to a number nobody can explain.
+
+A guarantee that lives in the shape of the interface is also one the Postgres implementation inherits
+for free: it has no way to offer a partial write, so it cannot be *used* to make one.
+
+**Cost accepted.** Callers that genuinely want one thing must build a batch for it, and a rebuild
+script cannot bulk-load positions without going through the projector. The second half of that is
+arguably a feature — see ADR-029 — but it is a real constraint and it will be felt the first time
+somebody wants a fast import path.
+
+**Rejected alternative.** Several write methods plus a `transaction()` context manager, which is what
+most ORMs encourage. Rejected because the guarantee then depends on every call site remembering to open
+the transaction, the version that forgets is indistinguishable at a glance from the version that does
+not, and the failure only appears under a crash at one specific instruction.
+
+---
+
+## ADR-021 — The store's reads are `async` even though the shipped implementation is a dict
+
+**Status:** accepted (slice 2)
+
+**Context.** `InMemoryPositionStore` is three dicts. `async def snapshot_for(...)` over a dict lookup
+is ceremony: it needs an event loop, it makes every caller a coroutine, and it buys nothing today.
+
+**Decision.** Every method on `PositionStore` is `async`, including the reads.
+
+**Why.** An interface should be shaped by the dependency that matters rather than the one that is
+convenient. The real store is a database, a database call suspends, and a protocol with synchronous
+reads cannot be implemented by one without either blocking the event loop or being rewritten along with
+every caller. Choosing the honest signature now costs a keyword; discovering it later costs a
+refactor of the projector, the cache and the HTTP layer at once.
+
+**Cost accepted.** Async-ness is contagious. Everything downstream of a read is now a coroutine, and
+that is the direct cause of ADR-022 — a read-modify-write cycle with suspension points in the middle
+needs a lock, which a synchronous store would not have needed. The pure model layer stays synchronous
+precisely because it sits on the other side of this boundary: `project` is a function of two values,
+and everything that suspends lives in the projection package.
+
+**Also accepted:** a subtler cost that only surfaced under mutation testing. Because the in-memory
+store never actually suspends, tests written against it cannot observe the lock at all — see ADR-023.
+
+---
+
+## ADR-022 — One `asyncio.Lock` is held across read → project → commit → notify
+
+**Status:** accepted (slice 2)
+
+**Context.** `Projector.apply` reads the snapshot, decides, writes, and notifies. With an async store
+(ADR-021) there are suspension points between those steps, so two events for the same position can
+interleave. This is the classic lost update, and its consequences here are silent in both directions:
+
+- two events for *different* instructions on the same position: both tasks read the same position,
+  each computes "version 1 with my amount in it", the last commit wins, and one instruction's money is
+  simply absent. `snapshot_count` still counts both instructions, so the count invariant is the only
+  thing in the service that would ever reveal it.
+- two deliveries of the *same* event: both tasks read "no snapshot yet", both treat themselves as a
+  first sighting, and one instruction is counted twice. The total is too high, which is the version
+  somebody eventually notices, because it can exceed the book.
+
+**Decision.** A single `asyncio.Lock` is acquired at the top of `apply` and held until after the change
+listener has returned. Decoding happens *outside* the lock, because it is pure and CPU-bound and cannot
+touch the store.
+
+**Why.** The projection is single-writer by design, and this is the cheapest possible way to say so.
+The alternative — per-position locking — is a real optimisation and the wrong one to make first: a
+cross-position move touches two keys, so it would need both locks, which introduces lock ordering,
+which introduces deadlock, in exchange for throughput nobody has measured a need for.
+
+Holding the lock across the *notification* as well is deliberate, and it is not about the store. It is
+about subscribers seeing versions in order. Release before notifying and two tasks can publish version
+6 after version 7; a subscriber that discards anything not newer than the last version it saw would
+ignore every subsequent update for that position, forever, from a race that leaves no trace.
+
+**Cost accepted.** The projector applies one event at a time, so throughput is bounded by the slowest
+store round trip and a slow change listener blocks ingestion. The second half is the load-bearing
+constraint on slice 3: subscriber delivery must not be allowed to block the projection, which is why
+the fan-out hub gets bounded per-subscriber queues rather than awaiting each subscriber's socket.
+
+**Rejected alternative.** No lock, on the grounds that a single consumer task delivers events
+sequentially anyway. Rejected because it makes a correctness property depend on a deployment detail
+nobody has written down: the day somebody runs two consumer tasks to double throughput, or replays a
+backlog with `asyncio.gather`, the projection silently starts losing money.
+
+---
+
+## ADR-023 — A test double that suspends, because the shipped store does not
+
+**Status:** accepted (slice 2)
+
+**Context.** Two concurrency tests were written for ADR-022, driving fifty events through
+`asyncio.gather` against `InMemoryPositionStore` and asserting that nothing is lost or duplicated.
+The slice-2 mutation matrix then deleted `async with self._lock` from `apply` — and the entire suite,
+including both of those tests, stayed green.
+
+**Decision.** The projection tests carry a second double, `_SuspendingStore`, which delegates to the
+in-memory store and awaits `asyncio.sleep(0)` before every operation. The lock's guarantee is pinned by
+two tests that use it. The original two are kept, with their docstrings corrected to state what they
+actually check.
+
+**Why.** The survivor exposed a wrong belief, not a missing assertion. **Awaiting a coroutine is not a
+suspension point.** `await` on a coroutine that never itself blocks runs it start to finish on the
+current task without a trip through the event loop, so `apply` over three dict operations is
+effectively one synchronous block. There is no interleaving for a lost update to happen in, and
+therefore no way for any test using that store to notice the lock is gone. The tests were asserting
+that the fold is correct under `gather`, which is worth pinning and is not what their names claimed.
+
+`asyncio.sleep(0)` is the minimal faithful model of the real dependency: one yield, which is what a
+network round trip costs a task in scheduling terms. `commit` yields *before* mutating, mirroring a
+round trip that reaches the database and then applies the whole transaction — so the batch stays atomic
+while the call as a whole is interruptible, which is exactly the shape the projector must be safe
+against.
+
+**Cost accepted.** A second double to keep in step with the protocol, and a test suite where two
+scenarios appear twice. Both doubles are therefore assigned to a `PositionStore`-annotated variable in
+a test of their own, so `mypy --strict` fails if either drifts from the contract — a double that has
+drifted is worse than no double, because it keeps passing after the thing it was written to catch has
+stopped being checked.
+
+**Also accepted:** the general lesson, which is why this is an ADR rather than a commit message. A
+concurrency test is only as real as its slowest dependency. Against an in-memory double, "concurrent"
+tests frequently prove nothing at all, and they are reassuring in exactly the way a bad test is
+reassuring. This one was caught by mutation testing and would not have been caught by review.
+
+---
+
+## ADR-024 — The checkpoint is a high-water mark, and a regression is counted rather than raised
+
+**Status:** accepted (slice 2)
+
+**Context.** `commit` receives the `event_id` of the event it is applying. The natural implementation
+is assignment: `self._checkpoint = batch.checkpoint`.
+
+**Decision.** `self._checkpoint = max(self._checkpoint, batch.checkpoint)`, and a `commit` that would
+have moved the checkpoint backwards increments a `checkpoint_regressions` counter. An equal checkpoint
+is not a regression.
+
+**Why.** "Checkpoint" does not mean "the last event I handled". It means "every event up to here has
+been considered", which is the only reading that makes resuming from it safe. Assignment would let a
+late event rewind the checkpoint, so a restart re-delivers everything in between — harmless in itself,
+because the snapshots deduplicate, but it makes the projection's progress non-monotonic and every lag
+graph built on it meaningless.
+
+The counter matters more than the clamp. Clamping is the correct response; clamping *silently* destroys
+the only evidence that delivery order has broken. A non-zero value means events are arriving out of
+`event_id` order, which is the assumption the entire resume-from-checkpoint design rests on — and a
+crash at that moment loses the late event permanently, because replay starts from the checkpoint and
+will never deliver it again. That is a data-loss window, and it is worth a metric.
+
+Equality is excluded because duplicates are the normal, healthy case on an at-least-once stream.
+Counting them would make the metric fire constantly and nobody would look at it again.
+
+**Cost accepted.** The counter is a plain attribute on the in-memory store rather than part of the
+protocol, so a Postgres implementation has to remember to expose an equivalent. Putting it in the
+protocol would have been the alternative; it was rejected because the protocol is the atomicity
+contract (ADR-020) and mixing observability into it makes the surface test in that ADR much weaker.
+
+**Rejected alternative.** Raising on a regression. Rejected because the clamp is correct and the batch
+is otherwise perfectly valid — refusing it would turn a monitoring signal into lost data.
+
+---
+
+## ADR-025 — Every counter is incremented after the commit returns, and a refusal is the exception
+
+**Status:** accepted (slice 2)
+
+**Context.** `ProjectionStats` is what `/projection` serves and what a dashboard is built on. The
+counters could be incremented as the event is handled, which reads naturally top to bottom, or only
+after the write is durable.
+
+**Decision.** Nothing in `ProjectionStats` moves until `commit` has returned — including
+`events_seen`. The one deliberate asymmetry: a message that fails to decode bumps `events_seen` and
+`refused` immediately, before returning `Refused`.
+
+**Why.** Counting first gets every number wrong in the same direction at exactly the moment the numbers
+matter. A commit that raises is retried by the consumer, so an event counted before the write is
+counted once per attempt: a database wobble shows up as a *rise* in applied events, and the one metric
+that should reveal a stuck projection instead reports a busy one. Counting after means a failing store
+produces a flat line, which is what an operator expects to see.
+
+The asymmetry is not an oversight. A refusal will never be retried — the message is undecodable, so
+re-reading it produces the same refusal forever — which means counting it immediately cannot
+double-count anything. And `events_seen` has to include refusals because it is the denominator: a
+refusal rate is only meaningful against everything that arrived.
+
+**Cost accepted.** The counter updates sit in a block after the commit rather than next to the code
+they describe, which reads slightly worse and is easy to "tidy" back. That is why the mutation matrix
+includes moving them, and why the comment above the block says what it is protecting.
+
+---
+
+## ADR-026 — A refusal does not advance the checkpoint, and the caller is handed the choice
+
+**Status:** accepted (slice 2)
+
+**Context.** `ingest` decodes a raw payload. A payload that cannot be decoded cannot be applied, and
+the tidy handling is catch-log-advance-continue: skip the poison message and keep going.
+
+**Decision.** `ingest` returns a `Refused` value carrying the decoder's message, and does **not**
+commit. Nothing in the projector decides what happens next.
+
+**Why.** The checkpoint is an `event_id`, and the reason a message was refused may be that its
+`event_id` was missing, non-integer, or zero. There is often no number to advance *to*. Inventing one
+— `checkpoint + 1`, say — would guess at the position of an event whose identity is unknown, and if
+the guess is low the projection re-reads it forever, while if it is high the projection has silently
+skipped events it never saw.
+
+Beyond that, catch-log-advance is a data-loss switch wearing the clothes of error handling. It reads
+like robustness and it means "acknowledge the message and lose it". The honest alternatives are to
+dead-letter the message and advance, or to stall the partition until somebody looks — and which one is
+correct depends on whether the stream is a payment feed or a metrics feed, which is knowledge the
+projection does not have. So it reports the fact and returns.
+
+`Refused` is a distinct type rather than an exception for the same reason `Skipped` is (ADR-008): the
+caller has to handle it, and a return type says so where a raised exception is an invitation to a bare
+`except`.
+
+**Cost accepted.** Every caller of `ingest` must handle three outcomes rather than two, and slice 5's
+consumer has to make the dead-letter decision explicitly instead of inheriting a default.
+
+---
+
+## ADR-027 — Subscribers are notified after the commit, and a listener failure propagates
+
+**Status:** accepted (slice 2)
+
+**Context.** `Projector` takes an optional `on_change` callback, which slice 3's fan-out hub will
+attach to. It can be called before or after the commit, and its exceptions can be swallowed or allowed
+to escape.
+
+**Decision.** The listener is called after `commit` returns, only when at least one position row
+actually changed, and an exception from it propagates.
+
+**Why.** Compare the worst cases. Notify-second's is a missed notification, which
+reconnect-and-resnapshot repairs, because a subscriber's recovery path is to fetch the current state.
+Notify-first's is published state that never existed: the commit then fails, the subscriber has been
+told about version 7, and on reconnect it finds version 6 — which it cannot distinguish from a
+rollback it should care about. Nothing repairs that.
+
+Only-when-changed follows from ADR-009. A no-op transition (`validated` after `received`) returns the
+same `Position` object, so `_build_changed_positions` drops it with an `is not` check and the batch
+carries a snapshot and zero rows. Waking every subscriber for a payload containing no visible
+difference is not merely wasteful — with slice 4's cache in place it evicts and reloads a hot position
+several times per instruction.
+
+Letting the exception escape is safe *because* the projection is idempotent, and that is the whole
+argument. The commit already happened, so the consumer's retry re-delivers the event, `project`
+returns `DUPLICATE`, and the checkpoint stays where it is. "Let it fail" here is a consequence of the
+design rather than an absence of one.
+
+**Cost accepted.** One broken subscriber can stall ingestion, since the listener is called under the
+lock (ADR-022). That is the explicit reason slice 3's hub must not await a subscriber's socket: it puts
+the event on a bounded queue and returns, and a subscriber that cannot keep up is disconnected rather
+than allowed to become back-pressure on the projection.
+
+---
+
+## ADR-028 — The projection publishes staleness and a watermark, never a number called "lag"
+
+**Status:** accepted (slice 2)
+
+**Context.** The obvious health metric for a read model is lag, and the obvious way to compute it is
+`now - last_event_at`.
+
+**Decision.** `ProjectionStats` exposes `last_event_id` and `last_event_at` as raw facts and computes
+nothing from them. There is no `lag` field, and the projector reads no clock.
+
+**Why.** `now - last_event_at` is *staleness*, and on an idle stream it grows by one second per second.
+A quiet Sunday and a dead consumer produce the same rising line, so the metric pages somebody for
+silence — and after that happens twice the alert is disabled, which is worse than never having had it.
+
+Real lag is `producer_head_event_id - last_event_id`, and this service cannot compute it, because it
+does not know the producer's head. Only the broker does. Publishing an honest pair of facts lets
+whatever *does* know join them; publishing a plausible number named "lag" guarantees somebody builds
+a dashboard on it and trusts it.
+
+This also keeps the promise made in ADR-010 for the model layer: `updated_at` is event time, and
+nothing in the projection path reads a wall clock. A projection that reads a clock produces different
+output on replay, which breaks the one property the whole design exists to have.
+
+**Cost accepted.** `/projection` serves two numbers a caller has to interpret rather than one that
+looks like an answer, and "how far behind are we?" has no single-field answer in this service.
+
+---
+
+## ADR-029 — A rebuild replays into an empty store, which is why there is no `truncate`
+
+**Status:** accepted (slice 2)
+
+**Context.** Read models get rebuilt: the fold changes, a bug is fixed, a bucket is added. The
+mechanism has to be decided before somebody needs it at 3am.
+
+**Decision.** A rebuild constructs a **new, empty** store and replays the stream into it, then swaps.
+`PositionStore` offers no `truncate`, no `delete`, and no direct position write, so there is no
+in-place rebuild path to reach for.
+
+**Why.** Replaying a full stream into a *populated* store does not produce the same state — and the
+failure mode is a good deal more confusing than "wrong numbers". For every instruction, the stored
+snapshot's `last_event_id` equals its final event, so on replay only that last event compares equal
+and returns `DUPLICATE`; every earlier event compares *less than* and returns `OUT_OF_ORDER`. So a
+rebuild-in-place quietly lights up the counter that exists to mean "the ordering guarantee has broken"
+(ADR-024) and drives `checkpoint_regressions` at the same time, in the middle of an operation somebody
+is performing precisely because they already do not trust the data.
+
+The replay-idempotence test asserts exactly this and documents the reason in its docstring, rather than
+weakening the assertion to `DUPLICATE`-or-`OUT_OF_ORDER` — the distinction is real and the test is
+where it is written down.
+
+Withholding `truncate` is the same argument as ADR-020, applied to operations instead of correctness.
+An interface that offers a hand-edit is one somebody hand-edits under pressure, leaving state that no
+replay reproduces and no test explains.
+
+**Cost accepted.** A rebuild needs enough memory or storage for two copies of the read model, and the
+swap has to be arranged by the caller. In exchange the old copy keeps serving traffic until the new one
+is complete, and a failed rebuild changes nothing at all — which is a better operational story than
+in-place truncation, where a rebuild that dies halfway leaves a live read model containing part of the
+stream.
+
+**Rejected alternative.** A `truncate()` on the protocol guarded by a comment. Rejected on the same
+grounds as the extra write methods: a guarantee that depends on a comment is not a guarantee, and the
+surface test in ADR-020 exists to keep this one from being added quietly.

@@ -67,6 +67,21 @@ OMIT = _Omit()
 INSTRUCTION_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 OTHER_INSTRUCTION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
 
+
+def instruction_id(index: int) -> uuid.UUID:
+    """A deterministic instruction id from a small integer, for tests that need many of them.
+
+    Derived from the index rather than generated, for the same reason `INSTRUCTION_ID` is a
+    constant: the concurrency test drives fifty instructions at once and a failure has to name
+    *which* one is short. `uuid4()` would give a fresh id per run, so the failure message would be
+    unreproducible and the test would be impossible to bisect.
+
+    The `4` and `8` are the version and variant nibbles, so the result is a well-formed v4 UUID and
+    goes through `uuid.UUID(...)` at the boundary exactly like a real one.
+    """
+    return uuid.UUID(f"{index:08x}-0000-4000-8000-000000000000")
+
+
 #: Timestamps are written as literals with an explicit offset, because "no timezone" is one of the
 #: things the boundary refuses and a builder using `datetime.now()` could not test that.
 OCCURRED_AT = "2026-03-01T09:30:00+00:00"
