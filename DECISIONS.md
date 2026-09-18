@@ -1677,3 +1677,378 @@ the rate measures. It is also reported separately, so the two can be told apart.
 
 **Cost accepted.** Consumers must handle a nullable number. That is one `if` in the dashboard query
 against a metric that cannot mislead.
+
+---
+
+## ADR-049 — The application is built by `create_app(service)`, not defined at import time
+
+**Status:** accepted (slice 5)
+
+**Context.** Every FastAPI tutorial opens with `app = FastAPI()` at module level, and every route is
+registered against that global. This service needs an app that can be handed a different store, and a
+test suite in which one test cannot see another's positions.
+
+**Decision.** `create_app(service: Service | None = None) -> FastAPI` builds and returns the app. The
+`Service` it is given is the composition root; omitted, it builds an in-memory one. Nothing is
+constructed at import time. Deployment runs `uvicorn position_view.api:create_app --factory`.
+
+**Why not a module-level app.** A module-level app makes the application a side effect of an import,
+which has two consequences that only look small. The store is created when the module is first
+imported, so every test in the process shares one — and a suite where tests can see each other's data
+is a suite that passes or fails depending on file ordering, which is the failure mode that makes
+people stop trusting tests rather than fix them. And there is no way to substitute a store without an
+environment variable and an `if`, so the production wiring and the test wiring diverge at exactly the
+point where they most need to be the same.
+
+**Why not `Depends` with `app.state`.** FastAPI's own idiom for injecting a collaborator is a
+dependency reading `request.app.state.service`, overridden in tests with
+`app.dependency_overrides`. It exists for a real reason and this service does not need it, because
+the substitution happens one level up in the `Service` the factory receives. What the closure buys
+instead is types: `app.state` is an untyped namespace, so `request.app.state.service` is `Any` and
+`mypy --strict` cannot tell you that a renamed method broke a route. The closed-over variable is a
+`Service` the whole way through. Given the choice between the framework's extension point and a
+version the type checker can see, with no requirement for the extension point, this takes the types.
+
+**Consequence worth stating.** There is no test-only branch anywhere in `app.py`. The default
+argument is not a test hook — it is what makes `--factory` a one-liner — and it is the same code path
+production takes.
+
+**Cost accepted.** A reader looking for `app` will not find one, and any tool that expects an
+importable ASGI callable needs `--factory` or a two-line wrapper. That is a one-time cost in a
+deployment command, paid once, against a class of test flakiness that is paid forever.
+
+---
+
+## ADR-050 — Freshness is a query parameter served by a gate of futures, and a timeout is a 503
+
+**Status:** accepted (slice 5)
+
+**Context.** This is a CQRS read model. The write side accepts an instruction and returns; this side
+finds out when the event arrives. So the client's very next read — the page refresh straight after the
+button click — is the one read most likely to be stale, and "eventually consistent" is no comfort at
+all to the person looking at a screen that has not changed. This is the standard complaint about CQRS
+and it is not inherent to the pattern: it is what happens when the read side offers no way to say
+*how* fresh an answer has to be.
+
+**Decision.** Both read routes accept `?await_event_id=` and `?timeout_ms=`. `POST /events` returns
+the `checkpoint` the projection reached, which is what a client passes back. A `CheckpointGate` holds
+one `asyncio.Future` per waiting request; `Service.ingest` calls `gate.advance(checkpoint)` after the
+projector has committed and the listeners have run. If the point is already passed, the read proceeds
+without suspending at all. If the wait times out, the response is **503 with `Retry-After`**, never a
+stale 200.
+
+**Why a future per waiter rather than a polling loop.** `while await store.checkpoint() < event_id:
+await sleep(0.005)` works and has three costs that all get worse exactly when the service is busy: a
+store read per waiter per tick; a latency floor of half a tick even when the data is already there;
+and a `sleep` in the request path, which puts a clock in every test that touches freshness, so the
+suite becomes either slow or flaky. Nothing polls here — `advance` is called once per ingested event
+by the code that ingested it.
+
+**Why the counter is monotonic (`max`, not assignment).** `advance` is called with whatever the store
+reports after an event, and two concurrent ingests can produce those reports out of order. A plain
+assignment would let the gate go backwards, and a reader already released by the higher value would be
+re-blocked by the lower one — a request that hangs for a reason no log line could explain.
+
+**Why 503 and not a stale 200 with a header.** The tempting alternative is to answer anyway and add
+"this may be behind", because an answer feels more useful than a failure. It is not: a client that
+asked for its own write back and receives an older version with a 200 will render it, and the person
+watching sees the number they just changed unchanged, and tries again — which is how one stale read
+becomes a duplicate instruction. A 503 is a thing a client can retry, log and alert on. A stale 200 is
+a thing it cannot even detect. 503 rather than 504 because nothing upstream timed out; this service is
+temporarily unable to handle the request, which is precisely what 503 means.
+
+**The hazard, and why it is survivable.** Some load balancers eject a backend that returns 5xx.
+Ejection is driven by the health check, and `/healthz` deliberately knows nothing about the
+projection's progress (ADR-053), so a burst of freshness timeouts cannot take a healthy node out of
+rotation.
+
+**Cost accepted.** A request can now occupy a connection and a worker slot while waiting. That is
+what ADR-059's ceiling is for.
+
+---
+
+## ADR-051 — Pydantic validates what belongs to HTTP; the event decoder validates events
+
+**Status:** accepted (slice 5)
+
+**Context.** `POST /events` is the consumer seam. The obvious FastAPI shape is a pydantic model of the
+envelope, which would give free validation, a documented request schema and typed access to fields.
+
+**Decision.** The body is annotated `dict[str, Any]` and handed straight to `decode_envelope`. Path
+parameters, query parameters and every *response* are pydantic-validated as usual. `Refused` becomes a
+400 carrying the decoder's own message; `Skipped` becomes a **200** with a reason.
+
+**Why not a pydantic model in front.** `decode_envelope` already *is* this service's wire contract. It
+is where `schema_version` is checked, where `1 == 1.0 == True` was found to be a real bug (ADR-013),
+where money is refused rather than rounded, and it carries 127 tests. A pydantic model would be a
+second, subtly different definition of the same contract — and the one that rejected a payload first
+would be the one with no tests behind it. Worse, its error shape would be pydantic's rather than the
+decoder's, so the reason a real event was refused would be reported in a vocabulary that appears
+nowhere in the projection's own logs. That is the single most expensive kind of divergence at 3am.
+
+**Why `dict[str, Any]` is not "no validation".** A JSON array still gets a 422, because "the body is
+an object" is a fact about the transport and FastAPI owns the transport. What is inside the object
+belongs to the model.
+
+**Why a skip is a 200.** A duplicate is at-least-once delivery working as designed. A 4xx would make
+every redelivery look like a client bug, and a consumer that retried on 4xx would loop forever. The
+`reason` field is what lets an operator tell "the broker sent it twice" from "nothing happened".
+
+**Cost accepted.** `/events` has no request schema in the OpenAPI document, so a generated client gets
+no type for the body. The consumers that matter are a broker consumer and an operator with `curl`,
+neither of which reads the generated client, and `model/envelope.py` is where the shape is documented.
+
+---
+
+## ADR-052 — Money crosses the wire as a JSON string, never as a JSON number
+
+**Status:** accepted (slice 5)
+
+**Context.** The model refuses to be approximately right about money: `parse_amount` traps `Inexact`
+rather than rounding. Serialisation is the last place that guarantee can be given away.
+
+**Decision.** Every amount is a `str` in every response and every SSE frame, formatted with `f"{d:f}"`.
+The instruction count next to it stays a JSON number.
+
+**Why.** A JSON number is a double in every mainstream parser. `JSON.parse('{"amount": 1500.75}')` in
+a browser produces an IEEE 754 binary float, and the client is then one addition away from
+`1500.7500000000001` — or, on a large book, away from losing a cent in a place nobody can trace. The
+service would have spent four modules being exact and handed it away in the layer least likely to be
+reviewed for arithmetic.
+
+**Why `f"{d:f}"` and not `str(d)`.** `str(Decimal("1E+3"))` is `"1E+3"`. Values with a large exponent
+arrive naturally from arithmetic on quantized decimals, so this is not a hypothetical shape, and a
+client parsing `"1.5E+3"` as money is a client that will one day parse it wrong. Fixed-point
+formatting has no exponential form to fall into.
+
+**Why the count stays a number.** It is an integer count of instructions, it cannot be fractional, and
+no parser will mangle it. Making it a string too would be consistency for its own sake at the cost of
+every consumer having to parse something that was never at risk.
+
+**Cost accepted.** Every consumer has to parse the string, and a naive one will call `parseFloat` and
+be back where it started. That is a consumer bug this API cannot prevent — but a string makes it a
+*choice*, visible in their code, rather than something the transport did to them silently.
+
+---
+
+## ADR-053 — `/healthz` is liveness only, and there is deliberately no `/readyz`
+
+**Status:** accepted (slice 5)
+
+**Context.** An orchestrator wants a probe. The instinct is to make it meaningful by having it check
+the store, and to add a readiness probe that reports whether the projection is caught up.
+
+**Decision.** `/healthz` returns `{"status": "ok"}` and touches nothing. There is no `/readyz`.
+`/projection` publishes `last_event_id`, `checkpoint`, `instructions_remembered` and the freshness
+counters as raw facts.
+
+**Why the health check verifies nothing.** A health check that verifies its dependencies turns one
+broken dependency into an outage. If `/healthz` read the store, a slow store would fail every
+replica's check simultaneously, the orchestrator would restart all of them together, and a service
+that could still serve cached reads would serve nothing — while the restarts added load to the
+dependency that was already struggling. The store's health belongs in the store's own alerting, where
+one alert fires instead of every replica flapping.
+
+**Why no readiness probe.** This service genuinely cannot know whether it is caught up. Real lag is
+`producer_head_event_id - last_event_id`, and only the broker knows the head. A readiness probe would
+therefore have to invent a threshold — "ready if staleness < 30s" — which on a quiet stream marks a
+perfectly caught-up projection as unready and takes a healthy service out of rotation for the crime of
+having nothing to do. Publishing the two raw numbers lets whoever can see both sides do the
+subtraction, which is the only place the answer exists.
+
+**Cost accepted.** A deployment that wants a readiness gate has to build it from `/projection` plus its
+own knowledge of the stream. That is more work for the operator and it is work only the operator can
+do correctly. An absence with a reason is documented here so it is not mistaken for an omission, and
+`test_there_is_no_readiness_probe` asserts the 404 so nobody adds one by accident.
+
+---
+
+## ADR-054 — The subscribe/snapshot handover happens inside the SSE generator
+
+**Status:** accepted (slice 5)
+
+**Context.** ADR-033 fixed the order: subscribe, snapshot, `mark_delivered`. *Where* that sequence
+runs is a separate decision, because it determines what can be reported when the snapshot read fails.
+
+**Decision.** All three steps run inside `position_stream`, after the response has begun. The
+subscription is held by a `with` block. A snapshot failure is reported as an `event: error` frame on a
+200 that has already started, and the generator returns.
+
+**Why not in the route function.** Doing the handover before returning the `StreamingResponse` would
+allow a clean 500 when the store fails, because the response would not have started yet. It would also
+allow a subscription created for a response that is never streamed: a client that disconnects in that
+window leaves a subscriber registered forever, being offered every change for the life of the process.
+Inside the generator, the `with` block's `finally` runs however the stream ends — normal return, client
+disconnect (a `CancelledError` thrown in by the server), or a failed snapshot. A leak that grows with
+client churn is worse than a degraded error path.
+
+**Why an `error` frame rather than closing the connection.** Once the response has started there is no
+status code left to set, so the choice is "tell the client something went wrong" or "close and let it
+guess". A client that receives an `error` frame knows to retry; a client that sees a clean close
+renders an empty book, which on a settlement screen looks like good news.
+
+**Why the `except` is broad here when ADR-046 made it narrow in the cache.** Different question. The
+cache narrows because it must not *cache* the consequence of an unexpected failure. This clause caches
+nothing and swallows nothing: it converts any failure into a frame that names it and then stops. A
+narrow clause would let an unexpected exception escape into the ASGI server, where it becomes a
+dropped connection — the outcome this decision exists to avoid.
+
+**Cost accepted.** A store outage on a new subscription is a 200 with an error frame rather than a 500,
+so it will not appear in a 5xx rate. `test_a_failed_snapshot_is_reported_as_an_error_frame` pins the
+frame, and the overflow frame gives the same class of client-visible signal for the same reason.
+
+---
+
+## ADR-055 — The live stream is at `/stream/positions`, not `/positions/stream`
+
+**Status:** accepted (slice 5)
+
+**Context.** `/positions/stream` reads better and groups the endpoint with the resource it serves.
+
+**Decision.** The SSE route is `/stream/positions`. The two read routes keep `/positions/...`.
+
+**Why.** `/positions/{counterparty}` and `/positions/stream` are the same shape, so they compete.
+FastAPI matches in registration order, which makes correctness depend on the order routes happen to
+be declared in — and no ordering saves it from a counterparty legitimately named `stream`, whose
+positions would become unreachable. The failure would present as a 404 for a position that exists,
+which is a long afternoon for whoever gets the ticket. Moving the stream to its own prefix means the
+paths cannot overlap at all, and `test_the_stream_path_is_not_shadowed_by_a_counterparty` asserts the
+absence so a later "tidy up" cannot reintroduce it.
+
+**Related absence: `Last-Event-ID`.** SSE has a resumption mechanism and this service cannot honour
+it, because it keeps no history of changes — only current state. A reconnecting client gets a fresh
+snapshot, which is correct by construction and is the reason the conflating buffer exists (ADR-029).
+Advertising a resumption we would then ignore would be worse than not advertising one: the client
+would trust an id we discard.
+
+**Cost accepted.** The URL groups by mechanism rather than by resource, so a reader scanning the route
+list sees positions in two places. One sentence in the docs against a class of shadowing bug that
+cannot be tested away once the paths overlap.
+
+---
+
+## ADR-056 — SSE is tested three ways, because `httpx.ASGITransport` buffers
+
+**Status:** accepted (slice 5)
+
+**Context.** Every other route in this service is tested in-process through `httpx.ASGITransport`: the
+real app, the real routing, the real validation, no port and no process. The obvious thing is to test
+the stream the same way.
+
+**Decision.** Request/response routes are tested through `ASGITransport`. Frame ordering, the
+heartbeat, the overflow report and the subscription's cleanup are tested by driving
+`position_stream(...)` directly as an async generator. Exactly **one** test starts a real `uvicorn`
+server on an OS-assigned port and reads the stream over TCP. `uvicorn` is therefore listed in both the
+`dev` and `serve` extras.
+
+**Why the stream cannot go through `ASGITransport`.** It buffers. Its response stream is
+`ASGIResponseStream(body: list[bytes])`, assembled after the application has finished: it collects
+every `http.response.body` message, waits for the app to complete, and only then hands the joined
+bytes to `httpx`. That is invisible for an ordinary route and fatal for this one — an event stream
+never completes, so `client.stream("GET", "/stream/positions")` would not return a response object at
+all. The test would not fail; it would hang until the suite was killed, which is the worst behaviour a
+test can have. This was found by running it, not by reasoning about it.
+
+**Why one real socket anyway.** An endpoint that buffered its own output would pass every generator
+assertion in the file: the frames would be correct, the order would be correct, and a client would see
+nothing until the connection ended, which for this endpoint is never. Flushing is a property of the
+transport, below anything the generator can observe, so it needs a real server. That test also
+exercises the real lifespan, the real `StreamingResponse`, the real headers and a real client
+disconnect, and it costs about a tenth of a second.
+
+**Why `uvicorn` is in `dev` as well as `serve`.** If it were only in `serve`, that test would have to
+be written as `pytest.importorskip("uvicorn")` — and a skipped test reports green while checking
+nothing. Naming the dependency in `dev` means the suite has no conditional coverage in it at all.
+
+**Cost accepted.** The stream is verified through two seams rather than one, so the route function's
+own three lines (parse keys, build the response, set headers) are covered by the socket test and the
+400 test rather than by the generator tests. Both are asserted, and the alternative was a suite that
+hangs.
+
+---
+
+## ADR-057 — The diagnostics return `as_dict()` verbatim and are not described in the schema
+
+**Status:** accepted (slice 5)
+
+**Context.** `/projection`, `/cache` and `/subscribers` publish numbers owned by `ProjectionStats`,
+`CachedPositions`, `SubscriptionHub` and `CheckpointGate`. FastAPI would like a response model.
+
+**Decision.** Those three return `dict[str, Any]` built from the objects' own `as_dict()`, with no
+pydantic model. `/healthz` *does* have a model.
+
+**Why no model.** The field names belong to the objects that own the numbers — `ProjectionStats` says
+so in its own docstring — and a pydantic mirror would be a second place to rename a metric. The
+failure mode is a dashboard that breaks for a reason nobody can find, because the rename looked
+complete. One definition means a renamed counter is visible immediately in the endpoint that publishes
+it.
+
+**Why `/healthz` is different.** Its response shape is a contract with an orchestrator rather than a
+report for a human, it has exactly one field, and it will not grow. A model there costs nothing and
+documents the probe's shape where a platform engineer will look for it.
+
+**Cost accepted, and it is real.** Those three bodies appear in the OpenAPI document only as "an
+object with some properties" — no named schema in `components`, so a generated client gets no type for
+them. They are for an operator with `curl` and a dashboard query.
+`test_the_diagnostics_are_not_described_in_the_openapi_schema` asserts the cost rather than hiding it,
+so this stays a decision instead of decaying into an oversight.
+
+---
+
+## ADR-058 — A missing position is a 404; a counterparty with no positions is an empty list
+
+**Status:** accepted (slice 5)
+
+**Context.** Two read routes, two plausible answers each. Should an unknown position be a zeroed body
+or a 404? Should an unknown counterparty be an empty list or a 404?
+
+**Decision.** `GET /positions/{cp}/{ccy}` returns **404** when nothing is known. `GET /positions/{cp}`
+returns **200** with `{"counterparty": ..., "positions": []}`. A malformed currency in the path is a
+**400**, not a 404. Absences are likewise dropped from an SSE snapshot rather than rendered as zeros.
+
+**Why not a zeroed position.** "No exposure" and "exposure of zero" are different facts and only one of
+them is known. A row of zeros is a claim this service cannot support, a misspelt counterparty in a URL
+would look like good news, and on a settlement screen that is the more dangerous of the two mistakes.
+The store makes the same distinction for the same reason.
+
+**Why the collection is not a 404.** A collection that exists and is empty is not a missing resource. A
+client rendering a table wants zero rows, not an exception. The 404 belongs where the caller named one
+specific thing.
+
+**Why 400 for a bad currency.** 400 and 404 are both defensible and they send whoever is debugging to
+different places: "your URL is wrong" points at their code, "no such position" points at the data.
+Naming the caller's mistake is more useful than reporting an absence that is a consequence of it.
+
+**Cost accepted.** A client that reads both routes has to handle a 404 on one and an empty list on the
+other, which looks inconsistent until the reason is read. The inconsistency is in the questions, not in
+the answers.
+
+---
+
+## ADR-059 — The freshness timeout has a server-side ceiling
+
+**Status:** accepted (slice 5)
+
+**Context.** `?timeout_ms=` lets a caller choose how long to wait. It arrives in the query string,
+which means it arrives from anybody.
+
+**Decision.** `timeout_ms` is `Query(ge=0, le=MAX_AWAIT_TIMEOUT_MS)` with `MAX_AWAIT_TIMEOUT_MS = 5000`
+and a default of `DEFAULT_AWAIT_TIMEOUT_MS = 1000`. `await_event_id` is `Query(ge=1)`. Both violations
+are FastAPI's own 422.
+
+**Why a ceiling.** Without one, `?timeout_ms=600000` is a way for any caller to pin ten minutes of
+server resources — a connection, a worker slot, a future in the gate — per request, from a URL that
+looks entirely innocent. That is a denial of service with no payload and nothing to detect. The ceiling
+is the control; the default is what keeps a caller who did not think about it from waiting forever.
+
+**Why `ge=1` on the event id.** `NO_CHECKPOINT` is 0, so awaiting event 0 is either meaningless or an
+uninitialised variable in the client. Refusing it turns a client bug into a 422 at the boundary rather
+than a read that appears to work and guarantees nothing.
+
+**Why 422 and not the API's own 400 envelope.** A query parameter is HTTP's business, and this is the
+one place the framework's validation is exactly right — which is the other half of ADR-051. Reproducing
+it by hand would mean two validators and one of them untested.
+
+**Cost accepted.** A caller with a legitimate need to wait longer than five seconds cannot, and must
+poll instead. Polling with a bounded wait is the behaviour that scales; a long single wait is the one
+that does not.

@@ -32,11 +32,18 @@ dev = [
     # this service makes no outbound HTTP calls at all, which is the opposite of edge-gateway and the
     # reason the dependency sits in a different list.
     "httpx~=0.28",
+    # ⚠️ `uvicorn` IS IN *BOTH* LISTS, AND THE DUPLICATION IS THE POINT.
+    #    It is a serving dependency: nothing in `src/` imports it. But one test starts a real server
+    #    on a real socket and reads an SSE stream over TCP, because the in-process transport proves
+    #    the frames are correct and proves nothing about whether they are *flushed* — a response that
+    #    only arrives when the generator finishes passes every in-process assertion and is useless as
+    #    a live stream. If uvicorn were only in `serve`, that test would have to be written as
+    #    `pytest.importorskip("uvicorn")`, and a skipped test is a test that reports green while
+    #    checking nothing. Naming it here means the suite has no conditional coverage in it at all.
+    "uvicorn~=0.46",
 ]
-# `uvicorn` is a *serving* dependency, not an importing one, and SSE is the reason it is worth naming
-# explicitly: a streaming response only behaves like a stream when there is a real server flushing it.
-# The in-process test client sees the same bytes, but nothing about buffering, and nothing about a
-# client that hangs up mid-stream.
+# The serving extra stays, because a deployment installs this and not `dev`: it is what `uvicorn
+# position_view.api:create_app --factory` needs, and nothing else.
 serve = ["uvicorn~=0.46"]
 
 [build-system]

@@ -20,12 +20,13 @@ and pinned by a test that its own docstring labels the most important one in the
 
 ## Status
 
-**Slices 1, 2, 3 and 4 of 5 complete** — the pure read-model core, the projector that owns a unit of
-work and a checkpoint, the fan-out hub that carries changes to live subscribers, and a read-through
-cache kept coherent by the change stream rather than by a timeout. The service now folds a real stream
-idempotently, pushes the result to any number of watchers without one of them being able to slow it
-down, and serves repeat reads — including reads for counterparties that do not exist — without touching
-the store. No HTTP yet.
+**All five slices complete.** The pure read-model core, the projector that owns a unit of work and a
+checkpoint, the fan-out hub that carries changes to live subscribers, a read-through cache kept
+coherent by the change stream rather than by a timeout, and an HTTP surface with read-your-writes and
+a live SSE feed. The service folds a real stream idempotently, pushes the result to any number of
+watchers without one of them being able to slow it down, serves repeat reads — including reads for
+counterparties that do not exist — without touching the store, and answers "have you caught up with my
+write yet?" with either the fresh answer or a 503, never with a stale 200.
 
 | | Slice | State |
 |---|---|---|
@@ -33,12 +34,12 @@ the store. No HTTP yet.
 | 2 | Projector + store protocol: atomic apply-and-checkpoint, replay | ✅ done — 444 tests, 32/32 mutants killed |
 | 3 | Subscription fan-out: conflating per-subscriber buffers, bounded | ✅ done — 502 tests, 43/43 mutants killed |
 | 4 | Read-through cache: single-flight, negative caching, invalidation | ✅ done — 573 tests, 57/57 mutants killed |
-| 5 | HTTP surface: FastAPI, read-your-writes, SSE, health and lag | ⬜ planned |
+| 5 | HTTP surface: FastAPI, read-your-writes, SSE, health and lag | ✅ done — 679 tests, 97/97 mutants killed |
 
-All four slices so far have no runtime dependencies at all — the whole thing is importable and
-testable with nothing installed but the toolchain, and it will run end to end against
-`InMemoryPositionStore`. FastAPI arrives in slice 5, and `tests/test_layering.py` fails the build if it
-drifts inward before then.
+The first four slices have no runtime dependencies at all — that part is importable and testable with
+nothing installed but the toolchain, and it runs end to end against `InMemoryPositionStore`. FastAPI
+appears in slice 5 and only inside `api/`, which `tests/test_layering.py` enforces by parsing the
+source: `model/` importing a framework fails the build, not a review.
 
 ### What slice 2 added
 
@@ -130,19 +131,102 @@ drifts inward before then.
   notification is never regenerated
   ([ADR-047](DECISIONS.md#adr-047--combine_listeners-runs-every-listener-then-raises)).
 
+### What slice 5 added
+
+- **Read-your-writes as a query parameter, and a timeout that is a 503 rather than a stale 200.**
+  `POST /events` returns the checkpoint it reached; a client passes that back as `?await_event_id=`
+  and the read suspends on a future until the projection passes it. A stale answer with a "may be
+  behind" header would be rendered by the client and believed by the person watching, who would then
+  reissue the instruction they had just issued — which is how one stale read becomes a duplicate
+  payment. A 503 is a thing a client can retry, log and alert on
+  ([ADR-050](DECISIONS.md#adr-050--freshness-is-a-query-parameter-served-by-a-gate-of-futures-and-a-timeout-is-a-503)),
+  with a server-side ceiling on the wait because a caller-chosen timeout is otherwise a denial of
+  service written in a URL
+  ([ADR-059](DECISIONS.md#adr-059--the-freshness-timeout-has-a-server-side-ceiling)).
+- **Pydantic validates HTTP; the event decoder validates events.** `POST /events` takes
+  `dict[str, Any]` and hands it straight to `decode_envelope`. A pydantic model in front would be a
+  second definition of a contract that already has 127 tests, and the one rejecting a payload first
+  would be the one with none — reporting the refusal in pydantic's vocabulary rather than in the words
+  the projection's own logs use
+  ([ADR-051](DECISIONS.md#adr-051--pydantic-validates-what-belongs-to-http-the-event-decoder-validates-events)).
+- **Money leaves as a JSON string, formatted fixed-point.** A JSON number is a double in every
+  mainstream parser, so serialising an amount as one would hand away the exactness the whole model was
+  built to protect, in the layer least likely to be reviewed for arithmetic. `f"{d:f}"` rather than
+  `str(d)`, because `str(Decimal("1E+3"))` is `"1E+3"`
+  ([ADR-052](DECISIONS.md#adr-052--money-crosses-the-wire-as-a-json-string-never-as-a-json-number)).
+- **`/healthz` checks nothing, and there is deliberately no `/readyz`.** A health check that verifies
+  its dependencies turns one slow store into every replica failing its probe at the same moment and
+  being restarted together — an outage manufactured out of a degradation. And readiness cannot be
+  computed here at all: real lag needs the producer's head event id, which only the broker knows, so a
+  probe would have to invent a threshold that marks a quiet, perfectly caught-up projection as unready
+  ([ADR-053](DECISIONS.md#adr-053--healthz-is-liveness-only-and-there-is-deliberately-no-readyz)).
+- **The SSE handover happens inside the generator, where the cleanup is guaranteed.** Doing it in the
+  route function would allow a clean 500 on a store failure — and would also leak a subscription for
+  every client that disconnects between the response being built and the stream being read. A leak
+  that grows with client churn is worse than a degraded error path, so a mid-handover failure is an
+  `error` frame on a 200 that has already begun
+  ([ADR-054](DECISIONS.md#adr-054--the-subscribesnapshot-handover-happens-inside-the-sse-generator)).
+- **The stream is at `/stream/positions`, not `/positions/stream`.** The prettier URL is one
+  counterparty named `stream` away from being unreachable, and the failure would present as a 404 for
+  a position that exists
+  ([ADR-055](DECISIONS.md#adr-055--the-live-stream-is-at-streampositions-not-positionsstream)).
+- **The diagnostics publish their owners' field names verbatim, and the OpenAPI cost is asserted.**
+  A pydantic mirror of `ProjectionStats` would be a second place to rename a metric, which is how a
+  dashboard breaks for a reason nobody can find. The trade — three endpoints with no named schema — is
+  pinned by a test, so it stays a decision instead of decaying into an oversight
+  ([ADR-057](DECISIONS.md#adr-057--the-diagnostics-return-as_dict-verbatim-and-are-not-described-in-the-schema)).
+- **A missing position is a 404; a counterparty with nothing outstanding is an empty list.** "No
+  exposure" and "exposure of zero" are different facts and only one of them is known, so a misspelt
+  counterparty must not render as a row of zeros — but a collection that exists and is empty is not a
+  missing resource
+  ([ADR-058](DECISIONS.md#adr-058--a-missing-position-is-a-404-a-counterparty-with-no-positions-is-an-empty-list)).
+
+Two type-checker facts are recorded in the tests rather than suppressed, because both look like test
+bugs and are not: starlette annotates `HTTPException.detail` as `str` while this API always puts the
+error envelope there (one `cast` helper, not a blanket `type: ignore`), and mypy narrows an attribute
+expression without widening it again at the end of an `async with` — so asserting `not
+subscription.is_closed` inside a block makes the assertion *after* the block unreachable under
+`warn_unreachable`. Reading the flag through a function call is the honest fix.
+
 ## Quick start
 
 Requires Python 3.12+.
 
 ```bash
 git clone <this repo> && cd position-view
-python -m pip install -e ".[dev]"      # pytest, pytest-asyncio, ruff, mypy, httpx
-python -m pytest                       # 573 tests, about a second — none of them sleep
+python -m pip install -e ".[dev]"      # pytest, pytest-asyncio, ruff, mypy, httpx, fastapi, uvicorn
+python -m pytest                       # 679 tests, about five seconds — none of them sleep on a clock
 python -m ruff check . && python -m ruff format --check .
 python -m mypy --strict src tests
 ```
 
-There is nothing to serve yet. Slice 5 adds the HTTP surface and a `[serve]` extra with `uvicorn`.
+To run it:
+
+```bash
+python -m pip install -e ".[serve]"
+python -m uvicorn position_view.api:create_app --factory --port 8000
+```
+
+`--factory` because there is no module-level `app` to import — the application is built by a function
+that takes its `Service`, which is what keeps the test wiring and the production wiring the same code
+path ([ADR-049](DECISIONS.md#adr-049--the-application-is-built-by-create_appservice-not-defined-at-import-time)).
+Then, in two terminals:
+
+```bash
+curl -N http://localhost:8000/stream/positions            # snapshot, then every change, then keep-alives
+
+curl -X POST http://localhost:8000/events -H 'content-type: application/json' -d '{
+  "event_id": 1, "schema_version": 1, "event_type": "instruction.received",
+  "aggregate_type": "instruction", "aggregate_id": "8f3c...", "occurred_at": "2026-03-01T09:30:00Z",
+  "data": {"counterparty": "ACME-BANK", "currency": "USD", "amount": "1500.75"}}'
+
+# read your own write: the checkpoint that POST returned, passed back
+curl 'http://localhost:8000/positions/ACME-BANK/USD?await_event_id=1'
+curl http://localhost:8000/projection    # what the projection has done, and the two numbers a lag alert needs
+```
+
+`uvicorn` is in the `dev` extra as well as `serve`, deliberately: one test needs a real socket, and the
+alternative — `pytest.importorskip` — is a test that reports green while checking nothing.
 
 ## The shape
 
@@ -151,7 +235,7 @@ model/        pure: values, the state machine, the projection step. Standard lib
 projection/   the store protocol and the loop that owns a unit of work and a checkpoint.
 push/         the fan-out hub: a conflating buffer per subscriber, bounded.
 cache/        read-through, single-flight, invalidated by version — never a store.
-api/          FastAPI, SSE, health. The only place a framework appears. (slice 5)
+api/          FastAPI, SSE, health. The only place a framework appears.
 ```
 
 The arrow runs one way, left to right, and it is enforced by a test that parses the AST rather than by
@@ -226,12 +310,22 @@ differently, each with the rejected alternative and the cost accepted. The ones 
   captured on the coroutine's first line is captured *later* than it looks.
 - **[ADR-047](DECISIONS.md)** — why a listener fan-out must not stop at the first failure, worked through
   to the actual consequence: not a logged error, but one subscriber permanently missing an update.
+- **[ADR-050](DECISIONS.md)** — the answer to the standard complaint about CQRS: a read model that
+  offers no way to say *how fresh* an answer must be is the reason "eventually consistent" feels like a
+  broken screen. A gate of futures, and a 503 rather than a stale 200.
+- **[ADR-051](DECISIONS.md)** — validation belongs to whichever layer owns the contract, which is why
+  the one endpoint in this service with no request schema is the one whose payload matters most.
+- **[ADR-053](DECISIONS.md)** — the health check that verifies nothing, and the readiness probe that
+  does not exist because this service cannot honestly compute one.
+- **[ADR-056](DECISIONS.md)** — the test-strategy ADR: `httpx.ASGITransport` buffers the entire response
+  body, so the obvious way to test an endless stream does not fail, it *hangs*. Includes why one real
+  socket is worth its tenth of a second.
 
 ## Verification
 
 | Gate | Result |
 |---|---|
-| `pytest` | 573 passed, **0 skipped**, ~1.3s |
+| `pytest` | 679 passed, **0 skipped**, ~5s |
 | `ruff check .` | clean (`E W F I B UP ASYNC RUF`, line length 100) |
 | `ruff format --check .` | clean |
 | `mypy --strict src tests` | clean, including `warn_unreachable` |
@@ -239,6 +333,7 @@ differently, each with the rejected alternative and the cost accepted. The ones 
 | Mutation matrix, slice 2 | **32 / 32 killed**, no survivors — one on the second attempt, see below |
 | Mutation matrix, slice 3 | **43 / 43 killed**, no survivors, first run |
 | Mutation matrix, slice 4 | **57 / 57 killed**, no survivors — after three tests were added and one production line deleted, see below |
+| Mutation matrix, slice 5 | **97 / 97 killed**, no survivors — after two tests were added and one redundant condition deleted, see below |
 
 ### The mutation matrix
 
@@ -360,6 +455,59 @@ has quietly stopped meaning anything, and a future reader would reasonably take 
 that promotion-on-insert matters here. The comment that replaced it says where the promotion that *does*
 matter lives, and where the deliberate lack of one lives.
 
+Slice 5 is the HTTP surface, and almost every way it can be wrong still returns `200 OK`. A stale
+answer is a valid response. A bucket wired to the wrong field is a valid response. A stream that never
+flushes looks, from inside the process, exactly like a stream that does. So its 97 mutations are mostly
+about *meaning* rather than about failure: the same shape carrying a different fact.
+
+| Mutation | What it breaks | Caught by |
+|---|---|---|
+| Money is serialised as a JSON number | Every browser client parses amounts as doubles, and the exactness the model was built for is gone | `test_money_crosses_the_wire_as_a_string_and_never_as_a_number` |
+| An amount is rendered with `str()` instead of fixed-point | A value with a large exponent goes out as `1.5E+3`, and one client one day reads it as 1.5 | `test_a_large_amount_renders_as_digits_and_not_in_exponent_form` |
+| `failed` is filled from `settled` | A failed instruction reads as a completed one — the most expensive wrong answer this payload can give | `test_each_bucket_reaches_the_field_that_names_it` |
+| A timed-out freshness wait reports success | Exactly the stale 200 the parameter exists to prevent, with no way for a client to detect it | `test_a_checkpoint_that_never_arrives_is_a_503_with_retry_after` |
+| The gate is advanced **before** the event is applied | A released reader is answered from the cache as it was before its own write | `test_ingest_advances_the_gate_after_the_listeners_have_run` |
+| The abandoned waiter is not removed from the gate | Every hopeless request leaks a future, so the leak is proportional to how far behind the projection is | `test_a_timed_out_read_leaves_no_waiter_behind` |
+| Startup does not seed the gate from the store | Every restart blocks freshness reads on data the store already holds | `test_startup_seeds_the_gate_from_the_store` |
+| The cache is dropped from the projector's fan-out | A read straight after a write is served the version before it, and nothing anywhere disagrees | `test_one_ingest_reaches_both_the_cache_and_the_subscribers` |
+| The projector reads *through* the cache | The fold computes from a possibly stale base and commits the result as truth | `test_the_cache_is_never_handed_to_the_projector_as_a_store` |
+| Shutdown does not close the hub | Every reader task is still parked when the server stops, so graceful shutdown always ends in a kill | `test_the_lifespan_closes_every_subscription_on_the_way_down` |
+| `mark_delivered` is dropped | A change committed inside the snapshot window is re-sent as an update, so a client doubles every position on connect | `test_a_change_committed_during_the_snapshot_is_not_re_sent` |
+| A frame is not terminated by a blank line | No SSE client can tell where a frame ends; the stream parses as one endless frame | `test_a_frame_is_an_event_line_a_data_line_and_a_blank_line` |
+| The heartbeat becomes a named event instead of a comment | Every client logs an unknown-event warning every 15 seconds, forever | `test_a_comment_frame_carries_no_event_name` |
+| The drain is unbounded, with no heartbeat | An idle connection is reaped by a proxy and the client is never told — the "dashboard was stale overnight" bug | `test_an_idle_stream_sends_a_keep_alive_comment` |
+| An overflow ends the stream silently | Losing data becomes indistinguishable from a normal close, so a client re-renders a frozen view | `test_a_subscriber_that_falls_behind_is_told_before_the_stream_ends` |
+| The snapshot is sent under the update event name | A client merges the snapshot into stale state instead of replacing it | `test_the_first_frame_is_the_retry_hint_and_the_second_is_the_snapshot` |
+| A readiness probe appears | An invented staleness threshold takes a caught-up projection out of rotation on a quiet stream | `test_there_is_no_readiness_probe` |
+| A skip is reported as a refusal | At-least-once delivery reads as a stream of 400s, and a consumer retrying on 4xx loops forever | `test_a_duplicate_is_a_200_with_a_reason` |
+| The reported checkpoint is a constant | The freshness token is useless, and the read-your-writes parameter quietly stops working | `test_the_checkpoint_from_a_post_is_usable_as_a_freshness_token` |
+| The stream moves under `/positions` | One counterparty named `stream` from being unreachable, presenting as a 404 for a position that exists | `test_the_stream_path_is_not_shadowed_by_a_counterparty` |
+
+**Three of those 97 survived the first run, and only two of them were test gaps.** The first was
+`failed` filled from `settled`: the suite's one full-body assertion reads a position with a single
+non-zero bucket, so three of the four fields were `0.00` and any mix-up *between those three* was
+invisible. Fixed by one test with four distinct amounts and four distinct counts.
+
+The second is the more interesting one, because there was already a test named for exactly the
+behaviour the mutation broke. `test_the_snapshot_is_not_re_sent_as_an_update` ingests its event *before*
+the stream starts — so by the time the subscription exists there is nothing buffered, `mark_delivered`
+has nothing to suppress, and deleting the call changes nothing that test can see. The window
+[ADR-033](DECISIONS.md#adr-033--a-subscription-is-registered-before-the-snapshot-is-read-and-mark_delivered-closes-the-gap)
+is about is the one where a change lands *between* subscribing and snapshotting, and reaching it needs
+the frame order: `retry` is yielded after the subscription is created and before the snapshot is read,
+so a generator suspended on that first yield is sitting inside the gap. Ingest there and the change is
+both buffered and included in the snapshot; what must follow is silence, not a repeat. A test named
+after a property is not the same thing as a test that reaches it.
+
+**The third survivor was not a test gap at all, and the honest response was to delete a line.**
+`parse_position_key` guarded with `if not separator or not counterparty.strip():` — and with
+`rpartition`, a string containing no slash comes back as `("", "", raw)`, so the counterparty is always
+empty in exactly the case the first clause was watching for. No input can reach that clause on its own,
+so no test can possibly fail when it is removed: an *equivalent* mutant, not an unkilled one. Dead logic
+that reads as a safeguard is worse than no safeguard, because the next reader trusts it. The clause is
+gone, the comment in its place explains why the check is unnecessary rather than missing, and the
+mutation was replaced with one on the same line that a test does catch.
+
 The matrix is a throwaway script rather than a committed tool: it answers "are these tests
 load-bearing?" once per slice, and a committed mutation runner would be a second thing to maintain for
 a question that is only asked at the end of a slice.
@@ -379,12 +527,13 @@ Test count by file:
 | File | Tests | What it pins |
 |---|---:|---|
 | `test_events.py` | 127 | The wire contract: what is accepted, what is dropped, what is refused |
+| `test_api.py` | 96 | Routes, freshness, ingest, SSE framing, the diagnostics, and the composition |
 | `test_project.py` | 84 | The transition arithmetic, dedup, check order, and a stream fold |
 | `test_positions.py` | 72 | The 16-pair transition table, the version rule, the identity contract |
 | `test_cache.py` | 67 | Single-flight, negative caching, the LRU bound, the invalidate races, the fan-out helper |
+| `test_layering.py` | 62 | The dependency arrow, the purity of `model/`, and that FastAPI stays inside `api/` |
 | `test_money.py` | 61 | Exactness, refusals, and the stdlib behaviour the module works around |
 | `test_hub.py` | 54 | Conflation, the handover, the bound, and that `publish` cannot block |
-| `test_layering.py` | 52 | The dependency arrow and the purity of `model/` |
 | `test_projector.py` | 35 | Atomicity, the lock, counter honesty, notification order, replay |
 | `test_store.py` | 21 | One unit of work, the high-water checkpoint, and the shape of the protocol |
 
@@ -394,7 +543,7 @@ under test — so a rule regression would have converted real assertions into sk
 was replaced with an explicit data table plus a completeness cross-check
 ([ADR-017](DECISIONS.md#adr-017--no-test-may-skip-on-a-condition-computed-by-the-code-under-test)).
 
-Four facts in this repository were found by tests rather than by reasoning, and all four are recorded
+Six facts in this repository were found by tests rather than by reasoning, and all six are recorded
 where they were fixed rather than tidied away:
 
 - `Decimal.quantize` rounds silently under the default context. The module's docstring had claimed the
@@ -411,6 +560,19 @@ where they were fixed rather than tidied away:
   `clear()` landing in that window was invisible to the load, which then refilled the cache it was
   supposed to have been discarded by. Two tests failed on their first run and both were right: the
   generation is now captured synchronously and passed in as a parameter.
+- `httpx.ASGITransport` buffers the whole response body: it collects every `http.response.body`
+  message, waits for the application to finish, and only then hands the joined bytes over. An event
+  stream never finishes, so requesting one through it does not fail — it hangs until somebody cancels
+  the suite, which is the worst behaviour a test can have. That is why the SSE tests drive the
+  generator directly and exactly one test starts a real server on a real port
+  ([ADR-056](DECISIONS.md#adr-056--sse-is-tested-three-ways-because-httpxasgitransport-buffers)).
+- `asyncio.wait_for(coro, timeout=0)` never runs the coroutine at all. It wraps it in a task, finds a
+  task that has not been scheduled to be not done, cancels it, and raises `TimeoutError`. So a
+  zero-length heartbeat interval can only ever produce keep-alives, and a test that expected `timeout=0`
+  to mean "check for a batch, then time out" was asserting something the fast path makes impossible.
+  Three tests are shaped by it: the ones asserting the timeout *branch* use zero because it is exact and
+  clock-free, and the one asserting that cancelling a drain cannot lose a batch uses ten milliseconds,
+  because that test needs the drain to genuinely start.
 
 ## Not what this is
 
