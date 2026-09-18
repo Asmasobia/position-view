@@ -1,0 +1,98 @@
+[project]
+name = "position-view"
+version = "0.1.0"
+description = "A CQRS read model: event-driven projection, real-time push, and a cache that cannot stampede."
+requires-python = ">=3.12"
+
+# The MODEL and the PROJECTION have no runtime dependencies, deliberately — see DECISIONS.md ADR-002.
+# Nothing under `position_view/model/` or `position_view/projection/` imports anything below, and that
+# is enforced by a test rather than by good intentions (`test_layering.py`).
+#
+# The reason is not minimalism for its own sake. A read model's hard parts are all *semantic*:
+# is this event a duplicate, does this transition make sense, whose numbers change. Every one of those
+# questions can be answered by a pure function over a snapshot and an event, and a pure function is
+# something you can test exhaustively in milliseconds. Bolt the projection to a database driver and
+# those questions can only be asked with a database running, which is how a projection ends up with
+# three tests and a prayer.
+dependencies = [
+    # The ASGI framework, which arrives with the HTTP surface in slice 5. Used for routing, dependency
+    # wiring, the lifespan hook that starts and stops the projector, and — unlike edge-gateway, which
+    # deliberately avoided it — for request validation, because this service owns its own contracts
+    # instead of forwarding somebody else's bytes.
+    "fastapi~=0.141",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest~=9.1",
+    "pytest-asyncio~=1.3",
+    "ruff~=0.16",
+    "mypy~=2.3",
+    # The test client for the ASGI app. `httpx` is a *test* dependency here and not a runtime one:
+    # this service makes no outbound HTTP calls at all, which is the opposite of edge-gateway and the
+    # reason the dependency sits in a different list.
+    "httpx~=0.28",
+]
+# `uvicorn` is a *serving* dependency, not an importing one, and SSE is the reason it is worth naming
+# explicitly: a streaming response only behaves like a stream when there is a real server flushing it.
+# The in-process test client sees the same bytes, but nothing about buffering, and nothing about a
+# client that hangs up mid-stream.
+serve = ["uvicorn~=0.46"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+# `pythonpath` rather than requiring `pip install -e .` first: no editable install, no build step, no
+# network access at test time. A suite with a setup ritual is a suite that stops being run, and the
+# build step is the part most likely to break for reasons unrelated to the code.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+
+# `--strict-markers` turns a typo'd marker into an error instead of a silent no-op. Without it,
+# `@pytest.mark.asyncio` misspelt as `@pytest.mark.asyncoi` makes the test silently never run, and a
+# coroutine test function that is never awaited PASSES vacuously — the worst possible failure mode for
+# a project whose subject is concurrency.
+#
+# `asyncio_mode = "strict"` requires the marker explicitly. `auto` is more convenient and means a sync
+# test that grows an `await` gets silently reinterpreted rather than reported.
+asyncio_mode = "strict"
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import sorting
+    "B",        # flake8-bugbear — catches the mutable-default and except-blind classes of bug
+    "UP",       # pyupgrade — keeps the code in modern idiom, which is one of the stated gaps
+    "ASYNC",    # flake8-async — flags blocking calls inside async def
+    "RUF",
+]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+# Matching the bar set in settlement-engine and edge-gateway: `mypy --strict` clean over src AND
+# tests, no per-file opt-outs. `warn_unreachable` earns its place in a projection specifically: it
+# catches a guard clause that can never fire, which is the usual symptom of a state machine whose
+# transitions do not mean what the author thought they meant.
